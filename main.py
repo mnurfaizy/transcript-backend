@@ -180,6 +180,33 @@ def submit_job(file_id, sheet_id, tab_name, row):
         return
 
 
+@app.get("/manual-recover")
+def manual_recover(transcript_id: str, sheet_id: str, row: int, tab_name: str = "Sheet1", token: str = ""):
+    """Endpoint darurat: tarik ulang transkrip yang sudah 'completed' di AssemblyAI
+    tapi webhook-nya gagal nyampe ke /webhook. Dipanggil manual lewat browser
+    (paste URL-nya langsung), bukan lewat Apps Script."""
+    if not APP_SECRET_TOKEN or token != APP_SECRET_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    creds = get_credentials()
+    try:
+        poll_resp = requests.get(
+            f"https://api.assemblyai.com/v2/transcript/{transcript_id}",
+            headers={"authorization": ASSEMBLYAI_API_KEY},
+        )
+        poll_resp.raise_for_status()
+        data = poll_resp.json()
+        status = data.get("status")
+        if status != "completed":
+            write_result(creds, sheet_id, tab_name, row, f"ERROR (status AssemblyAI: {status})")
+            return {"ok": False, "status": status}
+        transcript_text = data.get("text") or "(transkrip kosong)"
+        write_result(creds, sheet_id, tab_name, row, transcript_text)
+        return {"ok": True, "chars": len(transcript_text)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/webhook")
 async def webhook(request: Request):
     if request.headers.get("x-webhook-secret") != WEBHOOK_SECRET:
