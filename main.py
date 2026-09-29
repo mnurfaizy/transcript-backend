@@ -1,29 +1,35 @@
 """
 Backend transkripsi video Drive -> AssemblyAI -> tulis hasil ke Google Sheet.
-Versi webhook: submit job ke AssemblyAI lalu selesai - hasil transkrip datang
-lewat callback ke /webhook, bukan lewat polling yang bisa makan waktu lama.
+
+Input `file_id` boleh berupa ID FILE video ATAU ID FOLDER Drive:
+  Case 1: link langsung ke satu video
+  Case 2: link folder berisi beberapa video (file non-video dilewati, bukan error)
+  Case 3: link folder yang videonya ada di subfolder (dicari rekursif,
+          sampai kedalaman MAX_FOLDER_DEPTH)
+
+Hasil: satu video = satu sel. Video ke-1 ditulis di kolom `output_col`, ke-2 di
+kolom sebelahnya, dst. Blok kolom sebanyak `max_videos` dianggap milik fitur ini:
+sel yang tidak terpakai di blok itu dikosongkan.
 
 Alur:
-  POST /transcribe (dipanggil Apps Script, wajib header Authorization: Bearer <APP_SECRET_TOKEN>)
-    Tahap 1: Autentikasi service account
-    Tahap 2: Download video dari Google Drive (streaming ke file sementara)
-    Tahap 3: Upload video itu ke AssemblyAI
-    Tahap 4: Submit job transkripsi dengan webhook_url yang nunjuk balik ke /webhook
-    -> selesai, proses ini nggak nunggu transkripsi kelar
+  POST /transcribe (dari Apps Script, header Authorization: Bearer <APP_SECRET_TOKEN>)
+    -> langsung balas "diterima", lalu di background:
+       Resolve : cek file/folder, kumpulkan daftar video
+       Per video (satu per satu): download -> upload AssemblyAI -> submit job + webhook
+  POST /webhook (dipanggil AssemblyAI per video yang selesai)
+    -> ambil transkrip ber-timestamp, tulis ke sel video itu
 
-  POST /webhook (dipanggil AssemblyAI otomatis begitu transkrip selesai)
-    Ambil transkrip lengkap, tulis ke sel B<row> di Sheet.
-
-Kalau ada tahap yang gagal, pesan errornya ditulis ke sel yang sama supaya
-langsung kelihatan dari sheet-nya - detail lengkapnya selalu ada di log
-(tab "Logs" di dashboard Render).
+Kalau ada tahap yang gagal, pesan error ditulis ke sel video terkait (video lain
+tetap jalan). Detail lengkap ada di tab "Logs" Render.
 """
 
 import os
 import io
+import re
 import json
 import logging
 import tempfile
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, BackgroundTasks, Request, HTTPException
 from pydantic import BaseModel
@@ -44,39 +50,103 @@ SCOPES = [
 
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-APP_SECRET_TOKEN = os.environ.get("APP_SECRET_TOKEN")   # otentikasi dari Apps Script -> backend
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")       # verifikasi callback AssemblyAI -> backend
-BASE_URL = os.environ.get("BASE_URL")                   # URL publik service ini sendiri (https://xxx.onrender.com)
+APP_SECRET_TOKEN = os.environ.get("APP_SECRET_TOKEN")   # Apps Script -> backend
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")       # AssemblyAI -> backend
+BASE_URL = os.environ.get("BASE_URL")                   # URL publik service ini (tanpa trailing slash)
 
-# Ganti sesuai bahasa dominan di video kandidat. "id" = Indonesia.
+# Opsional (Environment Variable Render): seberapa dalam subfolder ditelusuri.
+MAX_FOLDER_DEPTH = int(os.environ.get("MAX_FOLDER_DEPTH", "5"))
+
+# Batas keras jumlah video per permintaan (pengaman kredit AssemblyAI).
+HARD_CAP_VIDEOS = 20
+
+# "id" = Indonesia. Ganti kalau bahasa dominan video berbeda.
 TRANSCRIPT_LANGUAGE_CODE = "id"
+
+FOLDER_MIME = "application/vnd.google-apps.folder"
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi", ".wmv", ".flv",
+    ".mpeg", ".mpg", ".mts", ".m2ts", ".mxf", ".3gp",
+}
+
+# Batas Google Sheets: 50.000 karakter per sel.
+MAX_CELL_CHARS = 49000
 
 
 class TranscribeRequest(BaseModel):
-    file_id: str
+    file_ids: list[str] = []   # satu atau lebih ID file video / folder (dari satu sel)
+    file_id: str = ""          # kompatibilitas versi lama (satu ID)
     sheet_id: str
     tab_name: str = "Sheet1"
     row: int
+    output_col: str = "B"   # kolom pertama untuk hasil
+    max_videos: int = 1     # jumlah kolom yang dicadangkan = maks video per baris
 
+
+# ---------------------------------------------------------------- helper umum
 
 def get_credentials():
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
 
 
-def write_result(creds, sheet_id, tab_name, row, text):
+def col_to_num(letters):
+    n = 0
+    for ch in letters.upper():
+        n = n * 26 + (ord(ch) - 64)
+    return n
+
+
+def num_to_col(n):
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def a1(tab_name, col, row):
+    # Nama tab berspasi (mis. "Initial Assessment") wajib dikutip di notasi A1.
+    safe_tab = tab_name.replace("'", "''")
+    return f"'{safe_tab}'!{col}{row}"
+
+
+def fit_cell(text):
+    if len(text) <= MAX_CELL_CHARS:
+        return text
+    cut = text[:MAX_CELL_CHARS]
+    idx = cut.rfind("\n\n")
+    if idx > MAX_CELL_CHARS * 0.8:
+        cut = cut[:idx]
+    hilang = len(text) - len(cut)
+    return (cut + "\n\n[TERPOTONG: transkrip melebihi batas 50.000 karakter per sel "
+            f"Google Sheets. {hilang} karakter terakhir tidak ditampilkan.]")
+
+
+def write_cell(creds, sheet_id, tab_name, row, col, text):
     sheets = build("sheets", "v4", credentials=creds)
-    range_ = f"{tab_name}!B{row}"
     sheets.spreadsheets().values().update(
         spreadsheetId=sheet_id,
-        range=range_,
+        range=a1(tab_name, col, row),
         valueInputOption="RAW",
-        body={"values": [[text]]},
+        body={"values": [[fit_cell(text)]]},
+    ).execute()
+
+
+def write_block(creds, sheet_id, tab_name, row, start_col, texts):
+    end_col = num_to_col(col_to_num(start_col) + len(texts) - 1)
+    rng = a1(tab_name, start_col, row) + f":{end_col}{row}"
+    sheets = build("sheets", "v4", credentials=creds)
+    sheets.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=rng,
+        valueInputOption="RAW",
+        body={"values": [[fit_cell(t) for t in texts]]},
     ).execute()
 
 
 def format_timestamp_ms(ms):
-    """Ubah milidetik jadi format MM:SS, atau H:MM:SS kalau lebih dari 1 jam."""
+    """Milidetik -> MM:SS, atau H:MM:SS kalau lebih dari 1 jam."""
     total_seconds = int(ms // 1000)
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -86,12 +156,11 @@ def format_timestamp_ms(ms):
 
 
 def fetch_timestamped_transcript(transcript_id):
-    """Ambil transkrip yang sudah dipecah per paragraf (masing-masing punya
-    timestamp start-nya sendiri dari AssemblyAI), format jadi teks dengan
-    prefix [MM:SS] atau [H:MM:SS] di tiap paragraf."""
+    """Transkrip per paragraf, tiap paragraf diawali timestamp [MM:SS]."""
     resp = requests.get(
         f"https://api.assemblyai.com/v2/transcript/{transcript_id}/paragraphs",
         headers={"authorization": ASSEMBLYAI_API_KEY},
+        timeout=60,
     )
     resp.raise_for_status()
     paragraphs = resp.json().get("paragraphs", [])
@@ -100,6 +169,122 @@ def fetch_timestamped_transcript(transcript_id):
     lines = [f"[{format_timestamp_ms(p['start'])}] {p['text']}" for p in paragraphs]
     return "\n\n".join(lines)
 
+
+def build_cell_text(transcript_id, label):
+    body = fetch_timestamped_transcript(transcript_id)
+    return f"== {label} ==\n\n{body}" if label else body
+
+
+def describe_failure(transcript_id, status):
+    try:
+        r = requests.get(
+            f"https://api.assemblyai.com/v2/transcript/{transcript_id}",
+            headers={"authorization": ASSEMBLYAI_API_KEY},
+            timeout=60,
+        )
+        return r.json().get("error") or status
+    except Exception:
+        return status
+
+
+# ------------------------------------------------ pencarian video di Drive
+
+def is_video(name, mime):
+    if mime and mime.startswith("video/"):
+        return True
+    # Beberapa video (mis. .mkv) kadang terdaftar sebagai file umum di Drive.
+    if not mime or mime == "application/octet-stream":
+        return os.path.splitext(name.lower())[1] in VIDEO_EXTENSIONS
+    return False
+
+
+def natural_key(s):
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s.lower())]
+
+
+def list_children(drive, folder_id):
+    items, page_token = [], None
+    while True:
+        resp = drive.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageSize=1000,
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        items.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+
+
+def collect_videos(drive, root_id, prefix=""):
+    """Telusuri folder (dan subfolder) -> (daftar video, daftar item yang dilewati)."""
+    videos, skipped, visited = [], [], set()
+    stack = [(root_id, prefix, 0)]
+    while stack:
+        folder_id, prefix, depth = stack.pop()
+        if folder_id in visited:
+            continue
+        visited.add(folder_id)
+        for item in list_children(drive, folder_id):
+            name, mime = item["name"], item.get("mimeType", "")
+            path = prefix + name
+            if mime == FOLDER_MIME:
+                if depth + 1 > MAX_FOLDER_DEPTH:
+                    skipped.append(f"{path}/ (subfolder terlalu dalam)")
+                else:
+                    stack.append((item["id"], path + "/", depth + 1))
+            elif is_video(name, mime):
+                videos.append({"id": item["id"], "name": name, "path": path})
+            else:
+                skipped.append(f"{path} ({mime})")
+    videos.sort(key=lambda v: natural_key(v["path"]))
+    return videos, skipped
+
+
+def summarize_skipped(skipped, limit=5):
+    if not skipped:
+        return ""
+    shown = "; ".join(skipped[:limit])
+    more = f" dan {len(skipped) - limit} lainnya" if len(skipped) > limit else ""
+    return f" {len(skipped)} item dilewati: {shown}{more}."
+
+
+def gather_videos(drive, root_ids, sa_email):
+    """Kumpulkan video dari satu atau lebih link (file atau folder), urut sesuai link.
+    Link yang tidak bisa diakses / bukan video dicatat, tidak menggagalkan link lain."""
+    videos, skipped, notes, seen = [], [], [], set()
+    multi = len(root_ids) > 1
+    for rid in root_ids:
+        try:
+            meta = drive.files().get(
+                fileId=rid, fields="id,name,mimeType", supportsAllDrives=True
+            ).execute()
+        except Exception as e:
+            log.warning("[Resolve] id=%s tidak bisa diakses: %s", rid, e)
+            notes.append(f"link {rid[:6]}... tidak bisa diakses (share ke {sa_email})")
+            continue
+        name, mime = meta["name"], meta.get("mimeType", "")
+        if mime == FOLDER_MIME:
+            log.info("[Resolve] Folder '%s' - mencari video (maks kedalaman %d)...", name, MAX_FOLDER_DEPTH)
+            found, skip = collect_videos(drive, rid, prefix=(name + "/") if multi else "")
+            skipped.extend(skip)
+        elif is_video(name, mime):
+            found = [{"id": meta["id"], "name": name, "path": name}]
+        else:
+            skipped.append(f"{name} ({mime})")
+            continue
+        for v in found:
+            if v["id"] not in seen:
+                seen.add(v["id"])
+                videos.append(v)
+    return videos, skipped, notes
+
+
+# ------------------------------------------------------------------ endpoint
 
 @app.get("/")
 def health():
@@ -112,78 +297,122 @@ def transcribe(req: TranscribeRequest, background_tasks: BackgroundTasks, reques
     if not APP_SECRET_TOKEN or auth_header != f"Bearer {APP_SECRET_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    log.info("Request diterima: file_id=%s, row=%s", req.file_id, req.row)
-    background_tasks.add_task(submit_job, req.file_id, req.sheet_id, req.tab_name, req.row)
-    return {"status": "diterima, sedang download & submit ke AssemblyAI"}
+    output_col = re.sub(r"[^A-Za-z]", "", req.output_col).upper() or "B"
+    max_videos = max(1, min(req.max_videos, HARD_CAP_VIDEOS))
+    root_ids = list(dict.fromkeys(i for i in (req.file_ids or [req.file_id]) if i))
+    if not root_ids:
+        raise HTTPException(status_code=400, detail="file_ids kosong")
+    log.info("Request diterima: %d link, tab=%s, row=%s, kolom=%s, maks_video=%s",
+             len(root_ids), req.tab_name, req.row, output_col, max_videos)
+    background_tasks.add_task(
+        process_request, root_ids, req.sheet_id, req.tab_name, req.row, output_col, max_videos
+    )
+    return {"status": "diterima, sedang mencari video & memproses di background"}
 
 
-def submit_job(file_id, sheet_id, tab_name, row):
-    """Download video + upload ke AssemblyAI + submit job.
-    Setelah job ke-submit, tugas ini SELESAI - transkrip datang lewat webhook."""
-
-    # Tahap 1: autentikasi
+def process_request(root_ids, sheet_id, tab_name, row, output_col, max_videos):
     try:
-        log.info("[Tahap 1/4] Autentikasi service account...")
         creds = get_credentials()
-        log.info("[Tahap 1/4] OK")
+        sa_email = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON).get("client_email", "service account")
     except Exception as e:
-        log.error("[GAGAL - Tahap 1] Autentikasi gagal: %s", e)
+        log.error("[GAGAL - Autentikasi] %s", e)  # tanpa kredensial, sheet tidak bisa ditulis
         return
 
-    tmp_path = None
+    def fail(msg):
+        log.error(msg)
+        try:
+            write_cell(creds, sheet_id, tab_name, row, output_col, msg)
+        except Exception as e2:
+            log.error("Gagal menulis pesan error ke sheet: %s", e2)
 
-    # Tahap 2: download video dari Drive
     try:
-        log.info("[Tahap 2/4] Download video dari Drive (file_id=%s)...", file_id)
         drive = build("drive", "v3", credentials=creds)
-        request_media = drive.files().get_media(fileId=file_id)
 
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        # --- Resolve: kumpulkan video dari semua link di sel
+        log.info("[Resolve] %d link Drive: %s", len(root_ids), ", ".join(root_ids))
+        videos, skipped, notes = gather_videos(drive, root_ids, sa_email)
+        total = len(videos)
+        log.info("[Resolve] Ditemukan %d video.%s", total, summarize_skipped(skipped))
+
+        if total == 0:
+            detail = (" " + "; ".join(notes) + ".") if notes else ""
+            fail("ERROR: tidak ada video ditemukan." + detail + summarize_skipped(skipped)
+                 + f" Pastikan link sudah di-share ke {sa_email} (minimal Viewer).")
+            return
+        if notes:
+            videos[0]["warn"] = "; ".join(notes)  # tampil di header sel video pertama
+
+        if total > max_videos:
+            fail(f"ERROR: ditemukan {total} video, tapi kolom hasil yang dicadangkan hanya "
+                 f"{max_videos}. Tambah OUTPUT_COLS di Apps Script atau pisahkan folder-nya.")
+            return
+
+        # --- Placeholder per video; sel sisa di blok dikosongkan
+        placeholders = [f"Diproses: [{i + 1}/{total}] {v['path']} - dalam antrean"
+                        for i, v in enumerate(videos)]
+        placeholders += [""] * (max_videos - total)
+        write_block(creds, sheet_id, tab_name, row, output_col, placeholders)
+
+        # --- Proses satu per satu (hemat RAM & disk di Render free)
+        start_num = col_to_num(output_col)
+        for i, video in enumerate(videos):
+            col = num_to_col(start_num + i)
+            process_one_video(creds, drive, video, i + 1, total, sheet_id, tab_name, row, col)
+
+        log.info("[Selesai] Semua %d video sudah disubmit; hasil menyusul lewat webhook.", total)
+    except Exception as e:
+        fail(f"ERROR (tak terduga): {e}")
+
+
+def process_one_video(creds, drive, video, idx, total, sheet_id, tab_name, row, col):
+    tag = f"[Video {idx}/{total}]"
+    name = video["path"]
+    tmp_path = None
+    stage = "download Drive"
+    try:
+        log.info("%s Tahap 1/3 Download: %s", tag, name)
+        request_media = drive.files().get_media(fileId=video["id"], supportsAllDrives=True)
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False, suffix=os.path.splitext(video["name"])[1] or ".bin"
+        )
         tmp_path = tmp.name
         tmp.close()
 
         fh = io.FileIO(tmp_path, "wb")
         downloader = MediaIoBaseDownload(fh, request_media, chunksize=10 * 1024 * 1024)
-        done = False
+        done, last_pct = False, -1
         while not done:
             status, done = downloader.next_chunk()
             if status:
-                log.info("  progress download: %d%%", int(status.progress() * 100))
+                pct = int(status.progress() * 100)
+                if pct // 20 != last_pct // 20:  # log tiap ~20%
+                    log.info("%s   progress download: %d%%", tag, pct)
+                    last_pct = pct
         fh.close()
+        log.info("%s Tahap 1/3 OK - %.1f MB", tag, os.path.getsize(tmp_path) / 1024 / 1024)
 
-        size_mb = os.path.getsize(tmp_path) / 1024 / 1024
-        log.info("[Tahap 2/4] OK - tersimpan sementara, ukuran %.1f MB", size_mb)
-    except Exception as e:
-        msg = f"ERROR (download Drive): {e}"
-        log.error("[GAGAL - Tahap 2] %s", e)
-        write_result(creds, sheet_id, tab_name, row, msg)
-        return
-
-    # Tahap 3: upload ke AssemblyAI
-    try:
-        log.info("[Tahap 3/4] Upload ke AssemblyAI...")
+        stage = "upload AssemblyAI"
+        log.info("%s Tahap 2/3 Upload ke AssemblyAI...", tag)
         with open(tmp_path, "rb") as f:
             upload_resp = requests.post(
                 "https://api.assemblyai.com/v2/upload",
                 headers={"authorization": ASSEMBLYAI_API_KEY},
                 data=f,
+                timeout=(15, 1800),
             )
         upload_resp.raise_for_status()
         upload_url = upload_resp.json()["upload_url"]
-        log.info("[Tahap 3/4] OK - upload_url diterima")
-    except Exception as e:
-        msg = f"ERROR (upload AssemblyAI): {e}"
-        log.error("[GAGAL - Tahap 3] %s", e)
-        write_result(creds, sheet_id, tab_name, row, msg)
-        return
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        log.info("%s Tahap 2/3 OK", tag)
 
-    # Tahap 4: submit job transkripsi dengan webhook - TIDAK POLLING DI SINI
-    try:
-        log.info("[Tahap 4/4] Submit job transkripsi (via webhook)...")
-        webhook_url = f"{BASE_URL}/webhook?sheet_id={sheet_id}&tab_name={tab_name}&row={row}"
+        stage = "submit AssemblyAI"
+        log.info("%s Tahap 3/3 Submit job (via webhook)...", tag)
+        params = {"sheet_id": sheet_id, "tab_name": tab_name, "row": row, "col": col}
+        label = name if (total > 1 or video.get("warn")) else ""
+        if video.get("warn"):
+            label += f" | PERINGATAN: {video['warn']}"
+        if label:
+            params["label"] = label
+        webhook_url = f"{BASE_URL}/webhook?{urlencode(params)}"
         submit_resp = requests.post(
             "https://api.assemblyai.com/v2/transcript",
             headers={"authorization": ASSEMBLYAI_API_KEY},
@@ -195,40 +424,44 @@ def submit_job(file_id, sheet_id, tab_name, row):
                 "webhook_auth_header_name": "x-webhook-secret",
                 "webhook_auth_header_value": WEBHOOK_SECRET,
             },
+            timeout=60,
         )
         submit_resp.raise_for_status()
-        job_id = submit_resp.json().get("id")
-        log.info("[Tahap 4/4] OK - job disubmit (id=%s), menunggu webhook callback", job_id)
+        log.info("%s Tahap 3/3 OK - job id=%s, menunggu webhook", tag, submit_resp.json().get("id"))
     except Exception as e:
-        msg = f"ERROR (submit AssemblyAI): {e}"
-        log.error("[GAGAL - Tahap 4] %s", e)
-        write_result(creds, sheet_id, tab_name, row, msg)
-        return
+        log.error("%s GAGAL di tahap '%s': %s", tag, stage, e)
+        try:
+            write_cell(creds, sheet_id, tab_name, row, col, f"ERROR ({stage}) - {name}: {e}")
+        except Exception as e2:
+            log.error("%s Gagal menulis pesan error ke sheet: %s", tag, e2)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 @app.get("/manual-recover")
-def manual_recover(transcript_id: str, sheet_id: str, row: int, tab_name: str = "Sheet1", token: str = ""):
+def manual_recover(transcript_id: str, sheet_id: str, row: int, tab_name: str = "Sheet1",
+                   col: str = "B", label: str = "", token: str = ""):
     """Endpoint darurat: tarik ulang transkrip yang sudah 'completed' di AssemblyAI
-    tapi webhook-nya gagal nyampe ke /webhook. Dipanggil manual lewat browser
-    (paste URL-nya langsung), bukan lewat Apps Script."""
+    tapi webhook-nya gagal nyampe. Dipanggil manual lewat browser."""
     if not APP_SECRET_TOKEN or token != APP_SECRET_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     creds = get_credentials()
     try:
-        poll_resp = requests.get(
+        r = requests.get(
             f"https://api.assemblyai.com/v2/transcript/{transcript_id}",
             headers={"authorization": ASSEMBLYAI_API_KEY},
+            timeout=60,
         )
-        poll_resp.raise_for_status()
-        data = poll_resp.json()
-        status = data.get("status")
+        r.raise_for_status()
+        status = r.json().get("status")
         if status != "completed":
-            write_result(creds, sheet_id, tab_name, row, f"ERROR (status AssemblyAI: {status})")
+            write_cell(creds, sheet_id, tab_name, row, col, f"ERROR (status AssemblyAI: {status})")
             return {"ok": False, "status": status}
-        transcript_text = fetch_timestamped_transcript(transcript_id)
-        write_result(creds, sheet_id, tab_name, row, transcript_text)
-        return {"ok": True, "chars": len(transcript_text)}
+        text = build_cell_text(transcript_id, label)
+        write_cell(creds, sheet_id, tab_name, row, col, text)
+        return {"ok": True, "chars": len(text)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -239,27 +472,31 @@ async def webhook(request: Request):
         log.warning("[WEBHOOK] Ditolak - secret nggak cocok")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    sheet_id = request.query_params.get("sheet_id")
-    tab_name = request.query_params.get("tab_name", "Sheet1")
-    row = int(request.query_params.get("row", 0))
+    q = request.query_params
+    sheet_id = q.get("sheet_id")
+    tab_name = q.get("tab_name", "Sheet1")
+    row = int(q.get("row", 0))
+    col = q.get("col", "B")       # default "B" supaya job lama (tanpa col) tetap jalan
+    label = q.get("label", "")
 
     body = await request.json()
     transcript_id = body.get("transcript_id")
     status = body.get("status")
-    log.info("[WEBHOOK] Diterima untuk row=%s: transcript_id=%s status=%s", row, transcript_id, status)
+    log.info("[WEBHOOK] row=%s kolom=%s transcript_id=%s status=%s", row, col, transcript_id, status)
 
     creds = get_credentials()
 
     if status != "completed":
-        write_result(creds, sheet_id, tab_name, row, f"ERROR (status AssemblyAI: {status})")
+        detail = describe_failure(transcript_id, status)
+        suffix = f" - {label}" if label else ""
+        write_cell(creds, sheet_id, tab_name, row, col, f"ERROR (AssemblyAI {status}){suffix}: {detail}")
         return {"ok": True}
 
     try:
-        transcript_text = fetch_timestamped_transcript(transcript_id)
-        write_result(creds, sheet_id, tab_name, row, transcript_text)
-        log.info("[WEBHOOK] SELESAI - hasil ditulis ke %s!B%d", tab_name, row)
+        write_cell(creds, sheet_id, tab_name, row, col, build_cell_text(transcript_id, label))
+        log.info("[WEBHOOK] SELESAI - hasil ditulis ke %s", a1(tab_name, col, row))
     except Exception as e:
         log.error("[WEBHOOK] Gagal ambil/tulis hasil: %s", e)
-        write_result(creds, sheet_id, tab_name, row, f"ERROR (ambil hasil transkrip): {e}")
+        write_cell(creds, sheet_id, tab_name, row, col, f"ERROR (ambil hasil transkrip): {e}")
 
     return {"ok": True}
