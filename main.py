@@ -28,10 +28,12 @@ import io
 import re
 import json
 import logging
+import queue
 import tempfile
+import threading
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, BackgroundTasks, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import requests
 from google.oauth2 import service_account
@@ -56,6 +58,12 @@ BASE_URL = os.environ.get("BASE_URL")                   # URL publik service ini
 
 # Opsional (Environment Variable Render): seberapa dalam subfolder ditelusuri.
 MAX_FOLDER_DEPTH = int(os.environ.get("MAX_FOLDER_DEPTH", "5"))
+
+# Penyimpanan sementara (/tmp) instance Render free dibatasi 2 GB. Video lebih besar
+# dari batas ini tidak di-download (kalau dipaksa, instance dimatikan Render dan
+# SEMUA job yang sedang jalan hilang). Bisa diubah lewat Environment Variable.
+MAX_VIDEO_MB = int(os.environ.get("MAX_VIDEO_MB", "1500"))
+MAX_VIDEO_BYTES = MAX_VIDEO_MB * 1024 * 1024
 
 # Batas keras jumlah video per permintaan (pengaman kredit AssemblyAI).
 HARD_CAP_VIDEOS = 20
@@ -198,6 +206,13 @@ def is_video(name, mime):
     return False
 
 
+def to_int(x):
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
 def natural_key(s):
     return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s.lower())]
 
@@ -207,7 +222,7 @@ def list_children(drive, folder_id):
     while True:
         resp = drive.files().list(
             q=f"'{folder_id}' in parents and trashed = false",
-            fields="nextPageToken, files(id, name, mimeType)",
+            fields="nextPageToken, files(id, name, mimeType, size)",
             pageSize=1000,
             pageToken=page_token,
             supportsAllDrives=True,
@@ -238,7 +253,7 @@ def collect_videos(drive, root_id, prefix=""):
                 else:
                     stack.append((item["id"], path + "/", depth + 1))
             elif is_video(name, mime):
-                videos.append({"id": item["id"], "name": name, "path": path})
+                videos.append({"id": item["id"], "name": name, "path": path, "size": to_int(item.get("size"))})
             else:
                 skipped.append(f"{path} ({mime})")
     videos.sort(key=lambda v: natural_key(v["path"]))
@@ -261,7 +276,7 @@ def gather_videos(drive, root_ids, sa_email):
     for rid in root_ids:
         try:
             meta = drive.files().get(
-                fileId=rid, fields="id,name,mimeType", supportsAllDrives=True
+                fileId=rid, fields="id,name,mimeType,size", supportsAllDrives=True
             ).execute()
         except Exception as e:
             log.warning("[Resolve] id=%s tidak bisa diakses: %s", rid, e)
@@ -273,7 +288,7 @@ def gather_videos(drive, root_ids, sa_email):
             found, skip = collect_videos(drive, rid, prefix=(name + "/") if multi else "")
             skipped.extend(skip)
         elif is_video(name, mime):
-            found = [{"id": meta["id"], "name": name, "path": name}]
+            found = [{"id": meta["id"], "name": name, "path": name, "size": to_int(meta.get("size"))}]
         else:
             skipped.append(f"{name} ({mime})")
             continue
@@ -284,6 +299,32 @@ def gather_videos(drive, root_ids, sa_email):
     return videos, skipped, notes
 
 
+# ------------------------------------------- antrean: satu permintaan per waktu
+
+# Instance Render free hanya 512 MB RAM / 0.1 CPU. Kalau beberapa baris dipicu
+# sekaligus lalu diproses paralel (download ratusan MB masing-masing), instance
+# bisa kelebihan beban dan restart, dan semua job yang sedang jalan hilang.
+# Karena itu semua permintaan masuk antrean FIFO dan dikerjakan satu per satu.
+JOBS = queue.Queue()
+
+
+def _worker():
+    while True:
+        args = JOBS.get()
+        row = args[3]
+        try:
+            log.info("[Antrean] mulai memproses baris %s (menunggu di belakangnya: %d)", row, JOBS.qsize())
+            process_request(*args)
+            log.info("[Antrean] baris %s selesai dikirim ke AssemblyAI", row)
+        except Exception as e:
+            log.error("[Antrean] baris %s error tak terduga: %s", row, e)
+        finally:
+            JOBS.task_done()
+
+
+threading.Thread(target=_worker, daemon=True, name="job-worker").start()
+
+
 # ------------------------------------------------------------------ endpoint
 
 @app.get("/")
@@ -292,7 +333,7 @@ def health():
 
 
 @app.post("/transcribe")
-def transcribe(req: TranscribeRequest, background_tasks: BackgroundTasks, request: Request):
+def transcribe(req: TranscribeRequest, request: Request):
     auth_header = request.headers.get("authorization", "")
     if not APP_SECRET_TOKEN or auth_header != f"Bearer {APP_SECRET_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -304,10 +345,10 @@ def transcribe(req: TranscribeRequest, background_tasks: BackgroundTasks, reques
         raise HTTPException(status_code=400, detail="file_ids kosong")
     log.info("Request diterima: %d link, tab=%s, row=%s, kolom=%s, maks_video=%s",
              len(root_ids), req.tab_name, req.row, output_col, max_videos)
-    background_tasks.add_task(
-        process_request, root_ids, req.sheet_id, req.tab_name, req.row, output_col, max_videos
-    )
-    return {"status": "diterima, sedang mencari video & memproses di background"}
+    JOBS.put((root_ids, req.sheet_id, req.tab_name, req.row, output_col, max_videos))
+    waiting = JOBS.qsize()
+    log.info("[Antrean] baris %s masuk antrean (menunggu giliran: %d)", req.row, waiting)
+    return {"status": "diterima, masuk antrean", "menunggu_di_depan": waiting}
 
 
 def process_request(root_ids, sheet_id, tab_name, row, output_col, max_videos):
@@ -367,6 +408,19 @@ def process_request(root_ids, sheet_id, tab_name, row, output_col, max_videos):
 def process_one_video(creds, drive, video, idx, total, sheet_id, tab_name, row, col):
     tag = f"[Video {idx}/{total}]"
     name = video["path"]
+
+    size = video.get("size")
+    if size and size > MAX_VIDEO_BYTES:
+        msg = (f"ERROR (file terlalu besar) - {name}: {size / 1024 / 1024:.0f} MB, melebihi batas "
+               f"{MAX_VIDEO_MB} MB (penyimpanan sementara Render free hanya 2 GB). "
+               "Video ini dilewati; video lain tetap diproses.")
+        log.error("%s %s", tag, msg)
+        try:
+            write_cell(creds, sheet_id, tab_name, row, col, msg)
+        except Exception as e2:
+            log.error("%s Gagal menulis pesan error ke sheet: %s", tag, e2)
+        return
+
     tmp_path = None
     stage = "download Drive"
     try:
