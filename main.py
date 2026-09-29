@@ -75,6 +75,32 @@ def write_result(creds, sheet_id, tab_name, row, text):
     ).execute()
 
 
+def format_timestamp_ms(ms):
+    """Ubah milidetik jadi format MM:SS, atau H:MM:SS kalau lebih dari 1 jam."""
+    total_seconds = int(ms // 1000)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def fetch_timestamped_transcript(transcript_id):
+    """Ambil transkrip yang sudah dipecah per paragraf (masing-masing punya
+    timestamp start-nya sendiri dari AssemblyAI), format jadi teks dengan
+    prefix [MM:SS] atau [H:MM:SS] di tiap paragraf."""
+    resp = requests.get(
+        f"https://api.assemblyai.com/v2/transcript/{transcript_id}/paragraphs",
+        headers={"authorization": ASSEMBLYAI_API_KEY},
+    )
+    resp.raise_for_status()
+    paragraphs = resp.json().get("paragraphs", [])
+    if not paragraphs:
+        return "(transkrip kosong)"
+    lines = [f"[{format_timestamp_ms(p['start'])}] {p['text']}" for p in paragraphs]
+    return "\n\n".join(lines)
+
+
 @app.get("/")
 def health():
     return {"status": "ok"}
@@ -200,7 +226,7 @@ def manual_recover(transcript_id: str, sheet_id: str, row: int, tab_name: str = 
         if status != "completed":
             write_result(creds, sheet_id, tab_name, row, f"ERROR (status AssemblyAI: {status})")
             return {"ok": False, "status": status}
-        transcript_text = data.get("text") or "(transkrip kosong)"
+        transcript_text = fetch_timestamped_transcript(transcript_id)
         write_result(creds, sheet_id, tab_name, row, transcript_text)
         return {"ok": True, "chars": len(transcript_text)}
     except Exception as e:
@@ -229,12 +255,7 @@ async def webhook(request: Request):
         return {"ok": True}
 
     try:
-        poll_resp = requests.get(
-            f"https://api.assemblyai.com/v2/transcript/{transcript_id}",
-            headers={"authorization": ASSEMBLYAI_API_KEY},
-        )
-        poll_resp.raise_for_status()
-        transcript_text = poll_resp.json().get("text") or "(transkrip kosong)"
+        transcript_text = fetch_timestamped_transcript(transcript_id)
         write_result(creds, sheet_id, tab_name, row, transcript_text)
         log.info("[WEBHOOK] SELESAI - hasil ditulis ke %s!B%d", tab_name, row)
     except Exception as e:
