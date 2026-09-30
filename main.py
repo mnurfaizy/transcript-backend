@@ -27,6 +27,7 @@ tetap jalan). Detail lengkap ada di tab "Logs" Render.
 import os
 import io
 import re
+import html
 import json
 import logging
 import queue
@@ -35,7 +36,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs
 
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
@@ -75,8 +76,19 @@ DISK_MAX_MB = int(os.environ.get("DISK_MAX_MB", "1500"))
 DISK_MAX_BYTES = DISK_MAX_MB * 1024 * 1024
 AUDIO_BITRATE = "64k"
 FFMPEG_TIMEOUT_S = int(os.environ.get("FFMPEG_TIMEOUT_S", "3600"))
+PROGRESS_LOG_EVERY_S = 30   # seberapa sering progres ekstraksi audio ditulis ke log
 
 DRIVE_MEDIA_URL = "https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&supportsAllDrives=true"
+
+# --- YouTube: transkrip diambil dari caption lewat Apify (satu video per panggilan);
+#     playlist diperluas dulu jadi daftar video lewat YouTube Data API v3 (gratis, butuh API key).
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN")
+APIFY_ACTOR = os.environ.get("APIFY_ACTOR", "pintostudio~youtube-transcript-scraper")
+YT_TRANSCRIPT_LANG = os.environ.get("YT_TRANSCRIPT_LANG", "id")
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
+YT_PARAGRAPH_SECONDS = 30   # caption digabung jadi paragraf tiap ~30 detik, diawali [MM:SS]
+APIFY_RUN_URL = "https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items"
+YOUTUBE_PLAYLIST_URL = "https://www.googleapis.com/youtube/v3/playlistItems"
 ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
 
 # Batas keras jumlah video per permintaan (pengaman kredit AssemblyAI).
@@ -98,6 +110,7 @@ MAX_CELL_CHARS = 49000
 class TranscribeRequest(BaseModel):
     file_ids: list[str] = []   # satu atau lebih ID file video / folder (dari satu sel)
     file_id: str = ""          # kompatibilitas versi lama (satu ID)
+    youtube_urls: list[str] = []   # link video / playlist YouTube (dari sel yang sama)
     sheet_id: str
     tab_name: str = "Sheet1"
     row: int
@@ -236,7 +249,7 @@ def list_children(drive, folder_id):
     while True:
         resp = drive.files().list(
             q=f"'{folder_id}' in parents and trashed = false",
-            fields="nextPageToken, files(id, name, mimeType, size)",
+            fields="nextPageToken, files(id, name, mimeType, size, capabilities(canDownload))",
             pageSize=1000,
             pageToken=page_token,
             supportsAllDrives=True,
@@ -267,7 +280,8 @@ def collect_videos(drive, root_id, prefix=""):
                 else:
                     stack.append((item["id"], path + "/", depth + 1))
             elif is_video(name, mime):
-                videos.append({"id": item["id"], "name": name, "path": path, "size": to_int(item.get("size"))})
+                videos.append({"id": item["id"], "name": name, "path": path, "size": to_int(item.get("size")),
+                           "can_download": (item.get("capabilities") or {}).get("canDownload")})
             else:
                 skipped.append(f"{path} ({mime})")
     videos.sort(key=lambda v: natural_key(v["path"]))
@@ -290,7 +304,7 @@ def gather_videos(drive, root_ids, sa_email):
     for rid in root_ids:
         try:
             meta = drive.files().get(
-                fileId=rid, fields="id,name,mimeType,size", supportsAllDrives=True
+                fileId=rid, fields="id,name,mimeType,size,capabilities(canDownload)", supportsAllDrives=True
             ).execute()
         except Exception as e:
             log.warning("[Resolve] id=%s tidak bisa diakses: %s", rid, e)
@@ -302,7 +316,8 @@ def gather_videos(drive, root_ids, sa_email):
             found, skip = collect_videos(drive, rid, prefix=(name + "/") if multi else "")
             skipped.extend(skip)
         elif is_video(name, mime):
-            found = [{"id": meta["id"], "name": name, "path": name, "size": to_int(meta.get("size"))}]
+            found = [{"id": meta["id"], "name": name, "path": name, "size": to_int(meta.get("size")),
+                      "can_download": (meta.get("capabilities") or {}).get("canDownload")}]
         else:
             skipped.append(f"{name} ({mime})")
             continue
@@ -325,11 +340,11 @@ JOBS = queue.Queue()
 def _worker():
     while True:
         args = JOBS.get()
-        row = args[3]
+        row = args[4]
         try:
             log.info("[Antrean] mulai memproses baris %s (menunggu di belakangnya: %d)", row, JOBS.qsize())
             process_request(*args)
-            log.info("[Antrean] baris %s selesai dikirim ke AssemblyAI", row)
+            log.info("[Antrean] baris %s selesai diproses", row)
         except Exception as e:
             log.error("[Antrean] baris %s error tak terduga: %s", row, e)
         finally:
@@ -356,17 +371,18 @@ def transcribe(req: TranscribeRequest, request: Request):
     output_col = re.sub(r"[^A-Za-z]", "", req.output_col).upper() or "B"
     max_videos = max(1, min(req.max_videos, HARD_CAP_VIDEOS))
     root_ids = list(dict.fromkeys(i for i in (req.file_ids or [req.file_id]) if i))
-    if not root_ids:
-        raise HTTPException(status_code=400, detail="file_ids kosong")
-    log.info("Request diterima: %d link, tab=%s, row=%s, kolom=%s, maks_video=%s",
-             len(root_ids), req.tab_name, req.row, output_col, max_videos)
-    JOBS.put((root_ids, req.sheet_id, req.tab_name, req.row, output_col, max_videos))
+    youtube_urls = list(dict.fromkeys(u.strip() for u in req.youtube_urls if u and u.strip()))
+    if not root_ids and not youtube_urls:
+        raise HTTPException(status_code=400, detail="tidak ada link Drive/YouTube")
+    log.info("Request diterima: %d link Drive, %d link YouTube, tab=%s, row=%s, kolom=%s, maks_video=%s",
+             len(root_ids), len(youtube_urls), req.tab_name, req.row, output_col, max_videos)
+    JOBS.put((root_ids, youtube_urls, req.sheet_id, req.tab_name, req.row, output_col, max_videos))
     waiting = JOBS.qsize()
     log.info("[Antrean] baris %s masuk antrean (menunggu giliran: %d)", req.row, waiting)
     return {"status": "diterima, masuk antrean", "menunggu_di_depan": waiting}
 
 
-def process_request(root_ids, sheet_id, tab_name, row, output_col, max_videos):
+def process_request(root_ids, youtube_urls, sheet_id, tab_name, row, output_col, max_videos):
     try:
         creds = get_credentials()
         sa_email = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON).get("client_email", "service account")
@@ -385,15 +401,22 @@ def process_request(root_ids, sheet_id, tab_name, row, output_col, max_videos):
         drive = build("drive", "v3", credentials=creds)
 
         # --- Resolve: kumpulkan video dari semua link di sel
-        log.info("[Resolve] %d link Drive: %s", len(root_ids), ", ".join(root_ids))
-        videos, skipped, notes = gather_videos(drive, root_ids, sa_email)
+        videos, skipped, notes = [], [], []
+        if root_ids:
+            log.info("[Resolve] %d link Drive: %s", len(root_ids), ", ".join(root_ids))
+            videos, skipped, notes = gather_videos(drive, root_ids, sa_email)
+        if youtube_urls:
+            log.info("[Resolve] %d link YouTube", len(youtube_urls))
+            yt_videos, yt_notes = gather_youtube(youtube_urls)
+            videos = videos + yt_videos
+            notes = notes + yt_notes
         total = len(videos)
         log.info("[Resolve] Ditemukan %d video.%s", total, summarize_skipped(skipped))
 
         if total == 0:
-            detail = (" " + "; ".join(notes) + ".") if notes else ""
-            fail("ERROR: tidak ada video ditemukan." + detail + summarize_skipped(skipped)
-                 + f" Pastikan link sudah di-share ke {sa_email} (minimal Viewer).")
+            detail = (" " + "; ".join(notes).rstrip(".") + ".") if notes else ""
+            hint = f" Untuk link Drive, pastikan sudah di-share ke {sa_email} (minimal Viewer)." if root_ids else ""
+            fail("ERROR: tidak ada video ditemukan." + detail + summarize_skipped(skipped) + hint)
             return
         if notes:
             videos[0]["warn"] = "; ".join(notes)  # tampil di header sel video pertama
@@ -413,11 +436,227 @@ def process_request(root_ids, sheet_id, tab_name, row, output_col, max_videos):
         start_num = col_to_num(output_col)
         for i, video in enumerate(videos):
             col = num_to_col(start_num + i)
-            process_one_video(creds, drive, video, i + 1, total, sheet_id, tab_name, row, col)
+            if video.get("kind") == "youtube":
+                process_youtube_video(creds, video, i + 1, total, sheet_id, tab_name, row, col)
+            else:
+                process_one_video(creds, drive, video, i + 1, total, sheet_id, tab_name, row, col)
 
-        log.info("[Selesai] Semua %d video sudah disubmit; hasil menyusul lewat webhook.", total)
+        log.info("[Selesai] Semua %d video diproses; transkrip video Drive menyusul lewat webhook.", total)
     except Exception as e:
         fail(f"ERROR (tak terduga): {e}")
+
+
+# ------------------------------------------------------------------- YouTube
+
+class NoCaptions(Exception):
+    pass
+
+
+def parse_youtube_url(url):
+    """-> ("video", id) | ("playlist", id) | (None, None).
+    Link /watch?v=ID&list=... dianggap SATU video (bukan seluruh playlist)."""
+    u = url.strip()
+    if not re.match(r"^https?://", u, re.I):
+        u = "https://" + u
+    try:
+        parsed = urlparse(u)
+    except ValueError:
+        return None, None
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+    q = parse_qs(parsed.query)
+    vid_re = r"[A-Za-z0-9_-]{11}"
+
+    if host == "youtu.be" or host.endswith(".youtu.be"):
+        m = re.match(rf"^/({vid_re})", path)
+        return ("video", m.group(1)) if m else (None, None)
+    if host == "youtube.com" or host.endswith(".youtube.com"):
+        v = (q.get("v") or [""])[0]
+        if path.startswith("/watch") and re.match(vid_re, v):
+            return "video", v[:11]
+        m = re.match(rf"^/(?:shorts|live|embed|v)/({vid_re})", path)
+        if m:
+            return "video", m.group(1)
+        lst = (q.get("list") or [""])[0]
+        if lst and (path.startswith("/playlist") or path.startswith("/watch")):
+            return "playlist", lst
+    return None, None
+
+
+def expand_playlist(playlist_id, limit=100):
+    """Isi playlist -> [(video_id, judul)] lewat YouTube Data API v3."""
+    if not YOUTUBE_API_KEY:
+        raise RuntimeError("YOUTUBE_API_KEY belum di-set di Render (dibutuhkan untuk membaca isi playlist)")
+    items, page_token = [], None
+    while len(items) < limit:
+        params = {"part": "snippet", "playlistId": playlist_id, "maxResults": 50, "key": YOUTUBE_API_KEY}
+        if page_token:
+            params["pageToken"] = page_token
+        try:
+            r = requests.get(YOUTUBE_PLAYLIST_URL, params=params, timeout=30)
+        except requests.RequestException as e:
+            raise RuntimeError("koneksi ke YouTube API gagal: " + str(e).replace(YOUTUBE_API_KEY, "***"))
+        if r.status_code != 200:
+            try:
+                msg = r.json()["error"]["message"]
+            except Exception:
+                msg = r.text[:150]
+            raise RuntimeError(f"YouTube API HTTP {r.status_code}: {msg}")
+        data = r.json()
+        for it in data.get("items", []):
+            sn = it.get("snippet") or {}
+            vid = (sn.get("resourceId") or {}).get("videoId")
+            if vid:
+                items.append((vid, sn.get("title", "")))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return items
+
+
+def gather_youtube(urls):
+    """Link YouTube (video / playlist) -> daftar video + catatan masalah."""
+    videos, notes, seen, private = [], [], set(), 0
+    for u in urls:
+        kind, yid = parse_youtube_url(u)
+        if kind == "video":
+            entries = [(yid, "")]
+        elif kind == "playlist":
+            try:
+                entries = expand_playlist(yid)
+            except Exception as e:
+                notes.append(f"playlist {yid[:8]}... gagal dibaca: {e}")
+                continue
+        else:
+            notes.append(f"link YouTube tidak dikenali: {u[:60]}")
+            continue
+        for vid, title in entries:
+            if title in ("Private video", "Deleted video"):
+                private += 1
+                continue
+            if vid in seen:
+                continue
+            seen.add(vid)
+            label = f"{title} (youtu.be/{vid})" if title else f"youtu.be/{vid}"
+            videos.append({"kind": "youtube", "id": vid, "name": title or vid, "path": label,
+                           "url": f"https://www.youtube.com/watch?v={vid}"})
+    if private:
+        notes.append(f"{private} video playlist private/terhapus dilewati")
+    return videos, notes
+
+
+def _to_float(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _clean_caption(text):
+    for _ in range(2):  # caption YouTube kadang ter-escape dua kali (&amp;#39;)
+        new = html.unescape(text)
+        if new == text:
+            break
+        text = new
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def format_youtube_segments(segments):
+    """Segmen caption [{start, dur, text}] -> paragraf ~30 detik, diawali [MM:SS]."""
+    groups = []  # [detik_mulai, [potongan teks]]
+    # Pengaman satuan: waktu mulai di atas 10 jam hampir pasti berarti milidetik, bukan detik.
+    starts = [_to_float(sg.get("start")) for sg in segments]
+    scale = 0.001 if starts and max(starts) > 36000 else 1.0
+    for seg in segments:
+        text = _clean_caption(str(seg.get("text", "")))
+        if not text:
+            continue
+        start = _to_float(seg.get("start")) * scale
+        if not groups or start - groups[-1][0] >= YT_PARAGRAPH_SECONDS:
+            groups.append([start, []])
+        groups[-1][1].append(text)
+    return "\n\n".join(f"[{format_timestamp_ms(int(g[0] * 1000))}] {' '.join(g[1])}" for g in groups)
+
+
+def fetch_youtube_transcript(video_url):
+    """Panggil actor Apify (satu video per run) dan kembalikan transkrip ber-timestamp."""
+    if not APIFY_TOKEN:
+        raise RuntimeError("APIFY_TOKEN belum di-set di Environment Variable Render")
+    url = APIFY_RUN_URL.format(actor=APIFY_ACTOR)
+    last_err = "tidak diketahui"
+    for attempt in (1, 2):
+        try:
+            r = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {APIFY_TOKEN}"},
+                json={"videoUrl": video_url, "targetLanguage": YT_TRANSCRIPT_LANG},
+                timeout=330,
+            )
+        except requests.RequestException as e:
+            last_err = "koneksi ke Apify gagal: " + str(e).replace(APIFY_TOKEN, "***")
+        else:
+            if r.status_code in (200, 201):
+                break
+            if r.status_code == 401:
+                raise RuntimeError("token Apify ditolak (HTTP 401) - token salah atau sudah dicabut")
+            if r.status_code == 402:
+                raise RuntimeError("kredit/batas biaya Apify habis (HTTP 402)")
+            last_err = f"Apify HTTP {r.status_code}: {r.text[:200]}"
+            if r.status_code < 500:
+                last_err += ". Kemungkinan video private/dihapus atau tidak punya caption."
+            if r.status_code < 500 and r.status_code != 408:
+                raise RuntimeError(last_err)
+        if attempt == 1:
+            time.sleep(5)
+    else:
+        raise RuntimeError(last_err)
+
+    try:
+        parsed = r.json()
+    except ValueError:
+        raise RuntimeError("respons Apify bukan JSON yang valid")
+    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) and "data" in parsed[0]:
+        segments = parsed[0]["data"]
+    elif isinstance(parsed, list):
+        segments = parsed
+    elif isinstance(parsed, dict):
+        segments = parsed.get("data")
+    else:
+        segments = None
+    if not isinstance(segments, list):
+        raise NoCaptions()
+    segments = [sg for sg in segments if isinstance(sg, dict)]
+    text = format_youtube_segments(segments) if segments else ""
+    if not text:
+        raise NoCaptions()
+    return text
+
+
+def process_youtube_video(creds, video, idx, total, sheet_id, tab_name, row, col):
+    tag = f"[Video {idx}/{total}]"
+    name = video["path"]
+
+    def write_err(msg):
+        log.error("%s %s", tag, msg)
+        try:
+            write_cell(creds, sheet_id, tab_name, row, col, msg)
+        except Exception as e2:
+            log.error("%s Gagal menulis pesan error ke sheet: %s", tag, e2)
+
+    try:
+        log.info("%s Ambil transkrip YouTube via Apify: %s", tag, name)
+        t0 = time.time()
+        text = fetch_youtube_transcript(video["url"])
+        label = name if (total > 1 or video.get("warn")) else ""
+        if video.get("warn"):
+            label += f" | PERINGATAN: {video['warn']}"
+        write_cell(creds, sheet_id, tab_name, row, col, f"== {label} ==\n\n{text}" if label else text)
+        log.info("%s OK - %d karakter (%.0f detik)", tag, len(text), time.time() - t0)
+    except NoCaptions:
+        write_err(f"ERROR (tidak ada caption) - {name}: video ini tidak punya caption/transkrip yang bisa "
+                  "diambil (dinonaktifkan pemilik, private, atau dihapus).")
+    except Exception as e:
+        write_err(f"ERROR (transkrip YouTube) - {name}: {e}")
 
 
 def upload_via_disk(creds, drive, video, tag, state):
@@ -463,27 +702,119 @@ def upload_via_disk(creds, drive, video, tag, state):
             os.unlink(tmp_path)
 
 
-def extract_audio_via_ffmpeg(creds, file_id, out_path):
+def format_hms(seconds):
+    seconds = int(seconds)
+    return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def probe_duration(token, file_id):
+    """Durasi video (detik) supaya progres bisa ditampilkan dalam persen. None kalau gagal."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-headers", f"Authorization: Bearer {token}\r\n",
+             "-show_entries", "format=duration", "-of", "default=nw=1:nk=1",
+             DRIVE_MEDIA_URL.format(file_id=file_id)],
+            capture_output=True, text=True, timeout=120,
+        )
+        return float(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+    except Exception:
+        return None
+
+
+def diagnose_drive_error(token, file_id):
+    """ffmpeg hanya melaporkan '403 Forbidden'. Minta 1 byte lewat API biasa untuk membaca
+    alasan asli dari Drive. Hasil: (status, reason, message) atau None kalau tidak bisa."""
+    try:
+        r = requests.get(
+            DRIVE_MEDIA_URL.format(file_id=file_id),
+            headers={"Authorization": f"Bearer {token}", "Range": "bytes=0-0"},
+            timeout=30,
+        )
+        if r.status_code < 400:
+            return None
+        err = r.json().get("error", {})
+        reason = ((err.get("errors") or [{}])[0]).get("reason", "")
+        return r.status_code, reason, err.get("message", "")
+    except Exception:
+        return None
+
+
+def explain_drive_error(status, reason, message, sa_email):
+    base = f"Drive menolak akses (HTTP {status}, alasan: {reason or 'tidak disebut'} - {message})."
+    if reason == "downloadQuotaExceeded":
+        return (base + " Kuota download file ini habis (batas dari Google per file). "
+                "Coba lagi beberapa jam atau 24 jam lagi, atau minta pemilik membuat salinan file.")
+    if status == 403:
+        return (base + " Kemungkinan pemilik/admin melarang download oleh viewer (opsi 'Batasi download'). "
+                f"Minta pemilik mengizinkan download, atau beri akses Editor ke {sa_email}.")
+    if status == 404:
+        return base + f" File tidak ditemukan atau belum di-share ke {sa_email}."
+    return base
+
+
+def extract_audio_via_ffmpeg(creds, file_id, out_path, tag=""):
     """ffmpeg membaca video langsung dari Drive lewat HTTP (mendukung Range, jadi MP4
-    yang metadata-nya di akhir file pun aman), membuang video, menyimpan audionya."""
+    yang metadata-nya di akhir file pun aman), membuang video, menyimpan audionya.
+    Progres ditulis ke log tiap PROGRESS_LOG_EVERY_S detik."""
     creds.refresh(GoogleAuthRequest())
     token = creds.token
+    duration = probe_duration(token, file_id)
+    if duration:
+        log.info("%s   durasi video: %s", tag, format_hms(duration))
     cmd = [
-        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-nostats",
+        "-progress", "pipe:1",
         "-headers", f"Authorization: Bearer {token}\r\n",
         "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
         "-i", DRIVE_MEDIA_URL.format(file_id=file_id),
         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
         "-y", out_path,
     ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    timed_out = {"v": False}
+
+    def _kill():
+        timed_out["v"] = True
+        proc.kill()
+
+    timer = threading.Timer(FFMPEG_TIMEOUT_S, _kill)
+    timer.start()
+    err_lines, cur, speed, last_log = [], None, "", time.time()
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
+        for raw in proc.stdout:
+            line = raw.strip()
+            m = re.match(r"^([a-z_0-9]+)=(.*)$", line)
+            if not m:
+                if line:
+                    err_lines.append(line)
+                continue
+            key, val = m.groups()
+            if key in ("out_time_us", "out_time_ms") and val.lstrip("-").isdigit() and int(val) > 0:
+                cur = int(val) / 1_000_000
+            elif key == "speed":
+                speed = val
+            now = time.time()
+            if cur is not None and now - last_log >= PROGRESS_LOG_EVERY_S:
+                last_log = now
+                pct = f" ({min(99, int(cur * 100 / duration))}%)" if duration else ""
+                total = f" dari {format_hms(duration)}" if duration else ""
+                log.info("%s   ekstrak audio: %s%s%s, kecepatan %s", tag, format_hms(cur), total, pct, speed or "?")
+        rc = proc.wait()
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+    if timed_out["v"]:
         raise RuntimeError(f"ffmpeg melebihi batas waktu {FFMPEG_TIMEOUT_S} detik")
-    if result.returncode != 0:
-        err = (result.stderr or "").replace(token, "***").strip()
+    if rc != 0:
+        err = "\n".join(err_lines[-6:]).replace(token, "***").strip()
         if "does not contain any stream" in err:
             raise RuntimeError("video ini tidak punya track audio")
+        if re.search(r"Server returned 4\d\d", err):
+            diag = diagnose_drive_error(token, file_id)
+            if diag:
+                sa = getattr(creds, "service_account_email", "service account")
+                raise RuntimeError(explain_drive_error(*diag, sa))
         raise RuntimeError("ffmpeg gagal: " + err[-300:])
 
 
@@ -499,7 +830,7 @@ def upload_via_audio(creds, drive, video, tag, state):
         tmp.close()
 
         t0 = time.time()
-        extract_audio_via_ffmpeg(creds, video["id"], tmp_path)
+        extract_audio_via_ffmpeg(creds, video["id"], tmp_path, tag)
         out_mb = os.path.getsize(tmp_path) / 1024 / 1024
         if out_mb <= 0:
             raise RuntimeError("hasil ekstraksi audio kosong")
@@ -532,6 +863,13 @@ def process_one_video(creds, drive, video, idx, total, sheet_id, tab_name, row, 
             write_cell(creds, sheet_id, tab_name, row, col, msg)
         except Exception as e2:
             log.error("%s Gagal menulis pesan error ke sheet: %s", tag, e2)
+
+    if video.get("can_download") is False:
+        sa = getattr(creds, "service_account_email", "service account")
+        write_err(f"ERROR (tidak boleh di-download) - {name}: pemilik/admin membatasi download untuk akun ini "
+                  f"(kemampuan 'canDownload' = false). Minta pemilik mengizinkan download, atau beri akses "
+                  f"Editor ke {sa}. Video ini dilewati; video lain tetap diproses.")
+        return
 
     size = video.get("size")
     use_audio = bool(size and size > DISK_MAX_BYTES)
