@@ -1241,38 +1241,65 @@ def format_youtube_segments(segments, guess_units=True):
     return "\n\n".join(f"[{format_timestamp_ms(int(g[0] * 1000))}] {' '.join(g[1])}" for g in groups)
 
 
-def fetch_youtube_transcript(video_url):
-    """Panggil actor Apify (satu video per run) dan kembalikan transkrip ber-timestamp."""
-    if not APIFY_TOKEN:
-        raise RuntimeError("APIFY_TOKEN belum di-set di Environment Variable Render")
+def _apify_call(video_url, lang):
+    """Satu panggilan actor Apify. Return Response (200/201), atau melempar:
+    _LangFail kalau actor gagal (HTTP 4xx selain 401/402) - biasanya bahasa itu tidak tersedia,
+    RuntimeError untuk masalah yang tidak ada gunanya dicoba dengan bahasa lain."""
     url = APIFY_RUN_URL.format(actor=APIFY_ACTOR)
+    payload = {"videoUrl": video_url}
+    if lang:
+        payload["targetLanguage"] = lang
     last_err = "tidak diketahui"
     for attempt in (1, 2):
         try:
-            r = requests.post(
-                url,
-                headers={"Authorization": f"Bearer {APIFY_TOKEN}"},
-                json={"videoUrl": video_url, "targetLanguage": YT_TRANSCRIPT_LANG},
-                timeout=330,
-            )
+            r = requests.post(url, headers={"Authorization": f"Bearer {APIFY_TOKEN}"}, json=payload, timeout=330)
         except requests.RequestException as e:
             last_err = "koneksi ke Apify gagal: " + str(e).replace(APIFY_TOKEN, "***")
         else:
             if r.status_code in (200, 201):
-                break
+                return r
             if r.status_code == 401:
                 raise RuntimeError("token Apify ditolak (HTTP 401) - token salah atau sudah dicabut")
             if r.status_code == 402:
                 raise RuntimeError("kredit/batas biaya Apify habis (HTTP 402)")
             last_err = f"Apify HTTP {r.status_code}: {r.text[:200]}"
-            if r.status_code < 500:
-                last_err += ". Kemungkinan video private/dihapus atau tidak punya caption."
             if r.status_code < 500 and r.status_code != 408:
-                raise RuntimeError(last_err)
+                raise _LangFail(last_err)
         if attempt == 1:
             time.sleep(5)
-    else:
-        raise RuntimeError(last_err)
+    raise RuntimeError(last_err)
+
+
+class _LangFail(Exception):
+    pass
+
+
+def fetch_youtube_transcript(video_url):
+    """Panggil actor Apify (satu video per run) dan kembalikan transkrip ber-timestamp.
+    Bahasa dicoba berurutan: YT_TRANSCRIPT_LANG (default 'id'), lalu tanpa bahasa (actor memilih
+    caption yang tersedia, mis. auto-generated Inggris), lalu 'en'. Video yang hanya punya caption
+    Inggris otomatis tidak lagi gagal gara-gara permintaan bahasa Indonesia."""
+    if not APIFY_TOKEN:
+        raise RuntimeError("APIFY_TOKEN belum di-set di Environment Variable Render")
+    langs = []
+    for lang in (YT_TRANSCRIPT_LANG if YT_TRANSCRIPT_LANG.lower() not in ("", "auto") else None, None, "en"):
+        if lang not in langs:
+            langs.append(lang)
+    r, errors = None, []
+    for lang in langs:
+        try:
+            r = _apify_call(video_url, lang)
+            if lang != langs[0]:
+                log.info("[YouTube] %s: caption bahasa '%s' tidak tersedia - memakai %s",
+                         video_url, langs[0] or "otomatis", f"'{lang}'" if lang else "caption yang tersedia")
+            break
+        except _LangFail as e:
+            errors.append(f"[{lang or 'otomatis'}] {e}")
+            log.warning("[YouTube] %s gagal dengan bahasa '%s' - mencoba opsi berikutnya", video_url, lang or "otomatis")
+    if r is None:
+        raise RuntimeError(" | ".join(errors) + ". Sudah dicoba bahasa: " +
+                           ", ".join(l or "otomatis" for l in langs) +
+                           ". Kemungkinan video private/dihapus, caption dimatikan, atau actor Apify sedang bermasalah.")
 
     try:
         parsed = r.json()
