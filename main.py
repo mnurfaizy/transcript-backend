@@ -1,18 +1,24 @@
 """
-Backend transkripsi video Drive -> AssemblyAI -> tulis hasil ke Google Sheet.
+Backend transkripsi video Drive/YouTube -> AssemblyAI/Apify -> file .md di Drive + link di Google Sheet.
 
-Input `file_id` boleh berupa ID FILE video ATAU ID FOLDER Drive:
+Versi untuk dashboard "Initial Assessment V.3":
+  kolom A = Nama kandidat, D = Project Assignment, G = Supporting Link (video/portfolio),
+  kolom H = Transcript Video (diisi link ke file .md).
+
+Input `file_ids` boleh berupa ID FILE video ATAU ID FOLDER Drive:
   Case 1: link langsung ke satu video
   Case 2: link folder berisi beberapa video (file non-video dilewati, bukan error)
   Case 3: link folder yang videonya ada di subfolder (dicari rekursif,
           sampai kedalaman MAX_FOLDER_DEPTH)
 
-Hasil: satu video = satu file Markdown (.md), disimpan lewat Web App Apps Script milik
-satu akun Google (folder Talent Assessment/<project>/). Di sheet, HANYA SATU SEL
-(`output_col`, mis. kolom G) yang ditulis: satu baris per video, berformat
-    [k/N] Judul video: https://drive.google.com/file/d/.../view     (selesai)
-    [k/N] Diproses: ... / [k/N] ERROR (...) ...                       (status)
-`max_videos` kini hanya batas jumlah video per baris (pengaman kredit), BUKAN jumlah kolom.
+Hasil: SATU BARIS = SATU FILE .md, apa pun jumlah videonya:
+  Talent Assessment / <Project Assignment> / transcript - <Nama kandidat>.md
+Tiap video menjadi satu bagian di file itu (judul + link video + transkrip ber-timestamp).
+Link file .md ditulis ke kolom `output_col` (H). Menjalankan ulang baris yang sama
+memperbarui file yang sama (tidak membuat duplikat).
+
+File .md dibuat oleh web app Apps Script milik pemilik folder (bukan service account:
+service account tidak punya kuota di My Drive Gmail pribadi).
 
 Alur:
   POST /transcribe (dari Apps Script, header Authorization: Bearer <APP_SECRET_TOKEN>)
@@ -21,10 +27,13 @@ Alur:
        Per video (satu per satu): ambil video/audio -> upload AssemblyAI -> submit job + webhook
        (video kecil di-download utuh; video besar cukup diekstrak audionya lewat ffmpeg)
   POST /webhook (dipanggil AssemblyAI per video yang selesai)
-    -> ambil transkrip ber-timestamp, simpan sebagai .md (Web App), tulis link-nya ke sel
+    -> ambil transkrip ber-timestamp, simpan sebagai bagian dari "job baris"
+  Begitu SEMUA video sebuah baris punya hasil (berhasil atau gagal):
+    -> susun satu file .md -> kirim ke web app Apps Script -> tulis link ke kolom H
 
-Kalau ada tahap yang gagal, pesan error ditulis di baris video terkait (video lain
-tetap jalan). Detail lengkap ada di tab "Logs" Render.
+Kalau ada video yang gagal tapi yang lain berhasil, file .md tetap dibuat dan bagian
+yang gagal ditandai "GAGAL" beserta alasannya. Kalau SEMUA gagal, pesan error ditulis
+ke sel H. Detail lengkap ada di tab "Logs" Render.
 """
 
 import os
@@ -39,10 +48,12 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode, urlparse, parse_qs
 
 from fastapi import FastAPI, Request, HTTPException
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 import requests
 from google.oauth2 import service_account
@@ -65,6 +76,12 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 APP_SECRET_TOKEN = os.environ.get("APP_SECRET_TOKEN")   # Apps Script -> backend
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")       # AssemblyAI -> backend
 BASE_URL = os.environ.get("BASE_URL")                   # URL publik service ini (tanpa trailing slash)
+
+# File .md ditulis lewat web app Apps Script (jalan sebagai pemilik folder Talent Assessment).
+DRIVE_WEBAPP_URL = os.environ.get("DRIVE_WEBAPP_URL")        # URL web app, berakhiran /exec
+DRIVE_WEBAPP_SECRET = os.environ.get("DRIVE_WEBAPP_SECRET")  # sama dengan Script Property TX_DRIVE_SECRET
+WITA = timezone(timedelta(hours=8))
+JOB_TTL_S = 12 * 3600       # job baris yang tak kunjung lengkap dibuang dari memori setelah 12 jam
 
 # Opsional (Environment Variable Render): seberapa dalam subfolder ditelusuri.
 MAX_FOLDER_DEPTH = int(os.environ.get("MAX_FOLDER_DEPTH", "5"))
@@ -119,23 +136,18 @@ MIN_TRANSCRIPT_CHARS = 30
 # Batas Google Sheets: 50.000 karakter per sel.
 MAX_CELL_CHARS = 49000
 
-# --- Penyimpanan hasil: file .md dibuat oleh Web App Apps Script (berjalan atas nama pemilik
-#     folder Talent Assessment), karena service account tidak punya kuota Drive sendiri.
-WEBAPP_URL = os.environ.get("WEBAPP_URL")       # URL "/exec" Web App penerima
-WEBAPP_TOKEN = os.environ.get("WEBAPP_TOKEN")   # sama persis dengan Script Property WEBAPP_TOKEN di Web App
-
 
 class TranscribeRequest(BaseModel):
     file_ids: list[str] = []   # satu atau lebih ID file video / folder (dari satu sel)
     file_id: str = ""          # kompatibilitas versi lama (satu ID)
     youtube_urls: list[str] = []   # link video / playlist YouTube (dari sel yang sama)
     sheet_id: str
-    tab_name: str = "Sheet1"
+    tab_name: str = "Initial Assessment V.3"
     row: int
-    output_col: str = "B"   # kolom pertama untuk hasil
-    max_videos: int = 1     # batas jumlah video per baris (pengaman kredit)
-    candidate_name: str = ""   # nama kandidat (kolom A) -> dipakai untuk nama file .md
-    project: str = ""          # nama project (kolom D) -> menentukan subfolder tujuan
+    output_col: str = "H"   # kolom untuk link hasil (Transcript Video)
+    max_videos: int = HARD_CAP_VIDEOS   # batas video per baris (pengaman kredit)
+    candidate: str = ""     # Nama kandidat (kolom A) -> nama file
+    project: str = ""       # Project Assignment (kolom D) -> nama folder
 
 
 # ---------------------------------------------------------------- helper umum
@@ -188,16 +200,28 @@ def write_cell(creds, sheet_id, tab_name, row, col, text):
     ).execute()
 
 
-def write_block(creds, sheet_id, tab_name, row, start_col, texts):
-    end_col = num_to_col(col_to_num(start_col) + len(texts) - 1)
-    rng = a1(tab_name, start_col, row) + f":{end_col}{row}"
+def write_link(creds, sheet_id, tab_name, row, col, url, label="Transcript"):
+    """Tulis teks `label` yang berlink ke `url` (rich-text link, tidak tergantung locale rumus)."""
     sheets = build("sheets", "v4", credentials=creds)
-    sheets.spreadsheets().values().update(
-        spreadsheetId=sheet_id,
-        range=rng,
-        valueInputOption="RAW",
-        body={"values": [[fit_cell(t) for t in texts]]},
+    meta = sheets.spreadsheets().get(
+        spreadsheetId=sheet_id, fields="sheets.properties(sheetId,title)"
     ).execute()
+    gid = next((s["properties"]["sheetId"] for s in meta.get("sheets", [])
+                if s["properties"]["title"] == tab_name), None)
+    if gid is None:
+        raise RuntimeError(f"tab '{tab_name}' tidak ditemukan di spreadsheet")
+    c = col_to_num(col) - 1
+    sheets.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={"requests": [{
+        "updateCells": {
+            "range": {"sheetId": gid, "startRowIndex": row - 1, "endRowIndex": row,
+                      "startColumnIndex": c, "endColumnIndex": c + 1},
+            "rows": [{"values": [{
+                "userEnteredValue": {"stringValue": label},
+                "textFormatRuns": [{"startIndex": 0, "format": {"link": {"uri": url}}}],
+            }]}],
+            "fields": "userEnteredValue,textFormatRuns",
+        }
+    }]}).execute()
 
 
 def format_timestamp_ms(ms):
@@ -225,9 +249,152 @@ def fetch_timestamped_transcript(transcript_id):
     return "\n\n".join(lines)
 
 
-def build_cell_text(transcript_id, label):
-    body = fetch_timestamped_transcript(transcript_id)
-    return f"== {label} ==\n\n{body}" if label else body
+# ----------------------------------------- satu baris = satu file .md
+
+class RowJob:
+    """Menampung hasil semua video dari SATU baris sheet sampai lengkap, lalu jadi satu file .md.
+    Disimpan di memori (sama seperti antrean): kalau Render restart, job yang berjalan hilang."""
+
+    def __init__(self, job_id, videos, notes, candidate, project, sheet_id, tab_name, row, col):
+        self.id = job_id
+        self.videos = videos
+        self.total = len(videos)
+        self.notes = notes
+        self.candidate = candidate
+        self.project = project
+        self.sheet_id = sheet_id
+        self.tab_name = tab_name
+        self.row = row
+        self.col = col
+        self.parts = {}          # idx (1-based) -> {"text", "error", "source"}
+        self.finalized = False
+        self.result = None       # {"ok": bool, "url"/"error": ...} setelah selesai
+        self.created = time.time()
+        self.lock = threading.Lock()
+
+
+ROW_JOBS = {}
+ROW_JOBS_LOCK = threading.Lock()
+
+
+def register_job(job):
+    now = time.time()
+    with ROW_JOBS_LOCK:
+        for jid in [k for k, j in ROW_JOBS.items() if now - j.created > JOB_TTL_S]:
+            log.warning("[Job] %s dibuang (lebih dari %d jam tidak lengkap)", jid, JOB_TTL_S // 3600)
+            ROW_JOBS.pop(jid, None)
+        ROW_JOBS[job.id] = job
+
+
+def get_job(job_id):
+    with ROW_JOBS_LOCK:
+        return ROW_JOBS.get(job_id)
+
+
+def submit_part(job, idx, text=None, error=None, source=""):
+    """Catat hasil satu video. Kalau ini video terakhir yang ditunggu, langsung susun & simpan file .md.
+    Fungsi ini tidak melempar error (semua kegagalan ditulis ke log / sel H)."""
+    with job.lock:
+        if job.finalized or idx in job.parts or not (1 <= idx <= job.total):
+            return
+        job.parts[idx] = {"text": text, "error": error, "source": source}
+        done = len(job.parts)
+        ready = done >= job.total
+        if ready:
+            job.finalized = True
+        else:
+            # progres ditulis di dalam lock supaya tidak menimpa hasil akhir dari thread lain
+            try:
+                write_cell(get_credentials(), job.sheet_id, job.tab_name, job.row, job.col,
+                           f"Diproses: {done}/{job.total} video selesai - menunggu sisanya")
+            except Exception as e:
+                log.warning("[Job %s] gagal menulis progres: %s", job.id, e)
+    if ready:
+        finalize_job(job)
+
+
+def build_markdown(job):
+    now = datetime.now(WITA).strftime("%Y-%m-%d %H:%M WITA")
+    ok = sum(1 for p in job.parts.values() if p.get("text"))
+    lines = [f"# Transcript - {job.candidate}", "",
+             f"- **Project:** {job.project}",
+             f"- **Diproses:** {now}",
+             f"- **Jumlah video:** {job.total} ({ok} berhasil)"]
+    if job.notes:
+        lines.append(f"- **Catatan:** {job.notes}")
+    lines += ["", "---", ""]
+    for i, v in enumerate(job.videos, start=1):
+        p = job.parts.get(i) or {}
+        lines.append(f"## {i}. {v['path']}" if job.total > 1 else f"## {v['path']}")
+        if v.get("link"):
+            lines.append(f"Link: {v['link']}")
+        if p.get("source"):
+            lines.append(f"Sumber transkrip: {p['source']}")
+        lines.append("")
+        lines.append(p["text"] if p.get("text") else f"> **GAGAL** - {p.get('error') or 'tidak ada hasil'}")
+        lines += ["", "---", ""]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def save_markdown_to_drive(project, candidate, content):
+    """Kirim isi .md ke web app Apps Script -> {'url', 'action', ...}. Aman diulang (file diperbarui by nama)."""
+    if not DRIVE_WEBAPP_URL or not DRIVE_WEBAPP_SECRET:
+        raise RuntimeError("DRIVE_WEBAPP_URL / DRIVE_WEBAPP_SECRET belum di-set di Environment Variable Render")
+    payload = {"secret": DRIVE_WEBAPP_SECRET, "project": project, "candidate": candidate, "content": content}
+    last = "tidak diketahui"
+    for attempt in (1, 2, 3):
+        try:
+            # Apps Script membalas lewat redirect 302; requests mengikutinya otomatis.
+            r = requests.post(DRIVE_WEBAPP_URL, json=payload, timeout=120)
+            try:
+                data = r.json()
+            except ValueError:
+                raise RuntimeError(
+                    f"web app Apps Script tidak membalas JSON (HTTP {r.status_code}). Cek deployment: "
+                    "'Execute as: Me' dan 'Who has access: Anyone', serta URL berakhiran /exec")
+            if not data.get("ok"):
+                raise RuntimeError("web app menolak: " + str(data.get("error", data))[:200])
+            return data
+        except Exception as e:
+            last = str(e).replace(DRIVE_WEBAPP_SECRET, "***")
+            log.warning("[Drive] percobaan %d/3 gagal: %s", attempt, last)
+            if "menolak" in last and "Unauthorized" in last:
+                break          # secret salah: mengulang tidak membantu
+            time.sleep(4 * attempt)
+    raise RuntimeError(last)
+
+
+def finalize_job(job):
+    """Semua video baris ini sudah punya hasil: simpan .md, tulis link (atau error) ke kolom hasil."""
+    with ROW_JOBS_LOCK:
+        ROW_JOBS.pop(job.id, None)
+    try:
+        creds = get_credentials()
+        good = [i for i, p in job.parts.items() if p.get("text")]
+        if not good:
+            errs = [job.parts[i].get("error") or "tidak ada hasil" for i in sorted(job.parts)]
+            msg = errs[0] if job.total == 1 else \
+                f"ERROR: semua {job.total} video gagal. " + " | ".join(f"[{i + 1}] {e}" for i, e in enumerate(errs))
+            log.error("[Job %s] %s", job.id, msg)
+            write_cell(creds, job.sheet_id, job.tab_name, job.row, job.col, msg)
+            job.result = {"ok": False, "error": msg}
+            return
+        res = save_markdown_to_drive(job.project, job.candidate, build_markdown(job))
+        write_link(creds, job.sheet_id, job.tab_name, job.row, job.col, res["url"])
+        failed = job.total - len(good)
+        log.info("[Job %s] SELESAI - %s (%s), %d/%d video berhasil -> %s",
+                 job.id, f"transcript - {job.candidate}.md", res.get("action", "?"), len(good), job.total, res["url"])
+        if failed:
+            log.warning("[Job %s] %d video gagal; ditandai GAGAL di dalam file .md", job.id, failed)
+        job.result = {"ok": True, "url": res["url"], "action": res.get("action"), "failed": failed}
+    except Exception as e:
+        msg = f"ERROR (simpan .md ke Drive): {e}"
+        log.error("[Job %s] %s", job.id, msg)
+        job.result = {"ok": False, "error": msg}
+        try:
+            write_cell(get_credentials(), job.sheet_id, job.tab_name, job.row, job.col, msg)
+        except Exception as e2:
+            log.error("[Job %s] gagal menulis pesan error ke sheet: %s", job.id, e2)
 
 
 def describe_failure(transcript_id, status):
@@ -240,117 +407,6 @@ def describe_failure(transcript_id, status):
         return r.json().get("error") or status
     except Exception:
         return status
-
-
-# ------------------------- hasil -> file .md (Web App) + status per video di SATU sel
-
-SLOT_RE = re.compile(r"^\[(\d+)/(\d+)\]\s")
-_SLOT_LOCK = threading.Lock()   # webhook beberapa video bisa datang bersamaan -> baca-ubah-tulis sel harus bergantian
-WIB = timezone(timedelta(hours=7))
-
-
-def one_line(text, limit=600):
-    s = re.sub(r"\s+", " ", str(text)).strip()
-    return s if len(s) <= limit else s[:limit - 1] + "…"
-
-
-def read_cell(creds, sheet_id, tab_name, col, row):
-    sheets = build("sheets", "v4", credentials=creds)
-    res = sheets.spreadsheets().values().get(
-        spreadsheetId=sheet_id, range=a1(tab_name, col, row)).execute()
-    vals = res.get("values") or []
-    return vals[0][0] if vals and vals[0] else ""
-
-
-def parse_slots(text):
-    slots, warns = {}, []
-    for line in str(text).split("\n"):
-        m = SLOT_RE.match(line)
-        if m:
-            slots[int(m.group(1))] = line
-        elif line.startswith("PERINGATAN:"):
-            warns.append(line)
-    return slots, warns
-
-
-def render_slots(slots, total, warns):
-    lines = list(warns)
-    for i in range(1, total + 1):
-        lines.append(slots.get(i, f"[{i}/{total}] Diproses: menunggu"))
-    return "\n".join(lines)
-
-
-def init_slots(creds, sheet_id, tab_name, row, col, total, texts, warn=""):
-    """Tulis status awal semua video sekaligus (menimpa isi sel)."""
-    lines = []
-    if warn:
-        lines.append("PERINGATAN: " + one_line(warn, 800))
-    lines += [f"[{i + 1}/{total}] {one_line(t)}" for i, t in enumerate(texts)]
-    with _SLOT_LOCK:
-        write_cell(creds, sheet_id, tab_name, row, col, "\n".join(lines))
-
-
-def update_slot(creds, sheet_id, tab_name, row, col, idx, total, text):
-    """Ubah baris video ke-idx saja; baris video lain dipertahankan."""
-    line = f"[{idx}/{total}] {one_line(text)}"
-    with _SLOT_LOCK:
-        try:
-            current = read_cell(creds, sheet_id, tab_name, col, row)
-        except Exception as e:
-            log.warning("Gagal membaca sel sebelum update (%s) - memakai sel kosong", e)
-            current = ""
-        slots, warns = parse_slots(current)
-        slots[idx] = line
-        write_cell(creds, sheet_id, tab_name, row, col, render_slots(slots, total, warns))
-
-
-def compose_md(title, body, cand, proj, src_video="", src_note=""):
-    meta = []
-    if cand:
-        meta.append(f"- Kandidat: {cand}")
-    if proj:
-        meta.append(f"- Project: {proj}")
-    if src_video:
-        meta.append(f"- Video: {src_video}")
-    if src_note:
-        meta.append(f"- Sumber transkrip: {src_note}")
-    meta.append(f"- Dibuat: {datetime.now(WIB).strftime('%Y-%m-%d %H:%M')} WIB")
-    return f"# Transkrip: {one_line(title, 300)}\n\n" + "\n".join(meta) + "\n\n---\n\n" + body.strip() + "\n"
-
-
-def save_markdown(title, content, cand, proj):
-    """Kirim ke Web App Apps Script -> file .md di Drive -> kembalikan URL file.
-    Aman diulang: nama file yang sama ditimpa, bukan diduplikasi."""
-    if not WEBAPP_URL or not WEBAPP_TOKEN:
-        raise RuntimeError("WEBAPP_URL / WEBAPP_TOKEN belum di-set di Environment Variable Render")
-    payload = {"token": WEBAPP_TOKEN, "candidate": cand, "project": proj,
-               "title": title, "content": content}
-    last = None
-    for attempt in range(1, 4):
-        try:
-            r = requests.post(WEBAPP_URL, json=payload, timeout=180)
-            try:
-                data = r.json()
-            except ValueError:
-                raise RuntimeError(f"Web App membalas bukan JSON (status {r.status_code}). Cek deployment: "
-                                   f"'Execute as: Me' + akses 'Anyone'. Awal balasan: {r.text[:120]!r}")
-            if not data.get("ok"):
-                raise RuntimeError(f"Web App menolak: {data.get('error')}")
-            return data["url"]
-        except Exception as e:
-            last = e
-            log.warning("[save_markdown] percobaan %d/3 gagal: %s", attempt, e)
-            if attempt < 3:
-                time.sleep(3 * attempt)
-    raise last
-
-
-def deliver_transcript(creds, sheet_id, tab_name, row, col, idx, total, title, body, cand, proj,
-                       src_video="", src_note=""):
-    md = compose_md(title, body, cand, proj, src_video, src_note)
-    url = save_markdown(title, md, cand, proj)
-    update_slot(creds, sheet_id, tab_name, row, col, idx, total, f"{title}: {url}")
-    return url, len(md)
 
 
 # ------------------------------------------------ pencarian video di Drive
@@ -395,6 +451,7 @@ def list_children(drive, folder_id):
 
 def make_video(item, path):
     return {"id": item["id"], "name": item["name"], "path": path, "size": to_int(item.get("size")),
+            "link": f"https://drive.google.com/file/d/{item['id']}/view",
             "can_download": (item.get("capabilities") or {}).get("canDownload")}
 
 
@@ -587,7 +644,9 @@ threading.Thread(target=_worker, daemon=True, name="job-worker").start()
 @app.get("/")
 def health():
     # "ffmpeg": true = ffmpeg terpasang (dibutuhkan untuk video besar)
-    return {"status": "ok", "ffmpeg": shutil.which("ffmpeg") is not None}
+    # "drive_webapp": true = DRIVE_WEBAPP_URL & DRIVE_WEBAPP_SECRET sudah di-set (untuk menyimpan file .md)
+    return {"status": "ok", "ffmpeg": shutil.which("ffmpeg") is not None,
+            "drive_webapp": bool(DRIVE_WEBAPP_URL and DRIVE_WEBAPP_SECRET)}
 
 
 @app.post("/transcribe")
@@ -596,23 +655,28 @@ def transcribe(req: TranscribeRequest, request: Request):
     if not APP_SECRET_TOKEN or auth_header != f"Bearer {APP_SECRET_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    output_col = re.sub(r"[^A-Za-z]", "", req.output_col).upper() or "B"
+    output_col = re.sub(r"[^A-Za-z]", "", req.output_col).upper() or "H"
     max_videos = max(1, min(req.max_videos, HARD_CAP_VIDEOS))
     root_ids = list(dict.fromkeys(i for i in (req.file_ids or [req.file_id]) if i))
     youtube_urls = list(dict.fromkeys(u.strip() for u in req.youtube_urls if u and u.strip()))
+    candidate, project = req.candidate.strip(), req.project.strip()
     if not root_ids and not youtube_urls:
         raise HTTPException(status_code=400, detail="tidak ada link Drive/YouTube")
-    log.info("Request diterima: %d link Drive, %d link YouTube, tab=%s, row=%s, kolom=%s, maks_video=%s",
-             len(root_ids), len(youtube_urls), req.tab_name, req.row, output_col, max_videos)
+    if not candidate or not project:
+        raise HTTPException(status_code=400, detail="nama kandidat / project assignment kosong")
+    log.info("Request diterima: %d link Drive, %d link YouTube, tab=%s, row=%s, kolom=%s, maks_video=%s, "
+             "kandidat=%s, project=%s", len(root_ids), len(youtube_urls), req.tab_name, req.row,
+             output_col, max_videos, candidate, project)
     JOBS.put((root_ids, youtube_urls, req.sheet_id, req.tab_name, req.row, output_col, max_videos,
-              req.candidate_name.strip(), req.project.strip()))
+              candidate, project))
     waiting = JOBS.qsize()
     log.info("[Antrean] baris %s masuk antrean (menunggu giliran: %d)", req.row, waiting)
     return {"status": "diterima, masuk antrean", "menunggu_di_depan": waiting}
 
 
 def process_request(root_ids, youtube_urls, sheet_id, tab_name, row, output_col, max_videos,
-                    candidate="", project=""):
+                    candidate, project):
+    job = None
     try:
         creds = get_credentials()
         sa_email = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON).get("client_email", "service account")
@@ -650,26 +714,32 @@ def process_request(root_ids, youtube_urls, sheet_id, tab_name, row, output_col,
             return
 
         if total > max_videos:
-            fail(f"ERROR: ditemukan {total} video, melebihi batas {max_videos} video per baris. "
-                 f"Pecah folder/playlist-nya, atau naikkan MAX_VIDEOS_PER_ROW di Apps Script (maks {HARD_CAP_VIDEOS}).")
+            fail(f"ERROR: ditemukan {total} video, melebihi batas {max_videos} per baris. "
+                 "Pisahkan folder/playlist-nya ke beberapa baris.")
             return
 
-        # --- Status awal per video: SATU sel (kolom output_col), satu baris per video.
-        init_slots(creds, sheet_id, tab_name, row, output_col, total,
-                   [f"Diproses: {v['path']} - dalam antrean" for v in videos],
-                   "; ".join(notes))
+        # --- Satu job per baris: menampung hasil semua video, lalu jadi satu file .md
+        note_parts = list(notes)
+        if skipped:
+            note_parts.append(summarize_skipped(skipped).strip())
+        job = RowJob(uuid.uuid4().hex[:12], videos, "; ".join(n for n in note_parts if n),
+                     candidate, project, sheet_id, tab_name, row, output_col)
+        register_job(job)
+        write_cell(creds, sheet_id, tab_name, row, output_col, f"Diproses: {total} video - dalam antrean")
 
         # --- Proses satu per satu (hemat RAM & disk di Render free)
         for i, video in enumerate(videos):
             if video.get("kind") == "youtube":
-                process_youtube_video(creds, video, i + 1, total, sheet_id, tab_name, row, output_col,
-                                      candidate, project)
+                process_youtube_video(creds, video, i + 1, total, job)
             else:
-                process_one_video(creds, drive, video, i + 1, total, sheet_id, tab_name, row, output_col,
-                                  candidate, project)
+                process_one_video(creds, drive, video, i + 1, total, job)
 
         log.info("[Selesai] Semua %d video diproses; transkrip video Drive menyusul lewat webhook.", total)
     except Exception as e:
+        if job is not None:
+            job.finalized = True   # hentikan job ini supaya webhook susulan tidak menimpa pesan error
+            with ROW_JOBS_LOCK:
+                ROW_JOBS.pop(job.id, None)
         fail(f"ERROR (tak terduga): {e}")
 
 
@@ -766,7 +836,8 @@ def gather_youtube(urls):
             seen.add(vid)
             label = f"{title} (youtu.be/{vid})" if title else f"youtu.be/{vid}"
             videos.append({"kind": "youtube", "id": vid, "name": title or vid, "path": label,
-                           "url": f"https://www.youtube.com/watch?v={vid}"})
+                           "url": f"https://www.youtube.com/watch?v={vid}",
+                           "link": f"https://www.youtube.com/watch?v={vid}"})
     if private:
         notes.append(f"{private} video playlist private/terhapus dilewati")
     return videos, notes
@@ -859,29 +930,26 @@ def fetch_youtube_transcript(video_url):
     return text
 
 
-def process_youtube_video(creds, video, idx, total, sheet_id, tab_name, row, col, cand="", proj=""):
+def process_youtube_video(creds, video, idx, total, job):
     tag = f"[Video {idx}/{total}]"
     name = video["path"]
 
-    def write_err(msg):
+    def fail_part(msg):
         log.error("%s %s", tag, msg)
-        try:
-            update_slot(creds, sheet_id, tab_name, row, col, idx, total, msg)
-        except Exception as e2:
-            log.error("%s Gagal menulis pesan error ke sheet: %s", tag, e2)
+        submit_part(job, idx, error=msg)
 
     try:
         log.info("%s Ambil transkrip YouTube via Apify: %s", tag, name)
         t0 = time.time()
         text = fetch_youtube_transcript(video["url"])
-        url, n = deliver_transcript(creds, sheet_id, tab_name, row, col, idx, total, name, text, cand, proj,
-                                    src_video=video["url"], src_note="caption YouTube (Apify)")
-        log.info("%s OK - %d karakter transkrip, file .md: %s (%.0f detik)", tag, len(text), url, time.time() - t0)
+        log.info("%s OK - %d karakter (%.0f detik)", tag, len(text), time.time() - t0)
     except NoCaptions:
-        write_err(f"ERROR (tidak ada caption) - {name}: video ini tidak punya caption/transkrip yang bisa "
+        fail_part(f"ERROR (tidak ada caption) - {name}: video ini tidak punya caption/transkrip yang bisa "
                   "diambil (dinonaktifkan pemilik, private, atau dihapus).")
     except Exception as e:
-        write_err(f"ERROR (transkrip YouTube) - {name}: {e}")
+        fail_part(f"ERROR (transkrip YouTube) - {name}: {e}")
+    else:
+        submit_part(job, idx, text=text, source="caption YouTube (via Apify)")
 
 
 # ------------------------------------------------- transkrip yang sudah ada di Drive
@@ -1136,17 +1204,13 @@ def upload_via_audio(creds, drive, video, tag, state):
             os.unlink(tmp_path)
 
 
-def process_one_video(creds, drive, video, idx, total, sheet_id, tab_name, row, col, cand="", proj=""):
+def process_one_video(creds, drive, video, idx, total, job):
     tag = f"[Video {idx}/{total}]"
     name = video["path"]
-    src_video = f"https://drive.google.com/file/d/{video['id']}/view"
 
-    def write_err(msg):
+    def fail_part(msg):
         log.error("%s %s", tag, msg)
-        try:
-            update_slot(creds, sheet_id, tab_name, row, col, idx, total, msg)
-        except Exception as e2:
-            log.error("%s Gagal menulis pesan error ke sheet: %s", tag, e2)
+        submit_part(job, idx, error=msg)
 
     sc = video.get("sidecar")
     if sc:
@@ -1156,19 +1220,13 @@ def process_one_video(creds, drive, video, idx, total, sheet_id, tab_name, row, 
         except Exception as e:
             log.warning("%s Transkrip Drive '%s' tidak bisa dipakai (%s) - lanjut ke AssemblyAI", tag, sc["name"], e)
         if body is not None:
-            try:
-                url, n = deliver_transcript(creds, sheet_id, tab_name, row, col, idx, total, name, body, cand, proj,
-                                            src_video=src_video,
-                                            src_note=f"file transkrip di Drive - {sc['name']}")
-                log.info("%s Transkrip sudah ada di Drive (%s: %s) - dipakai, AssemblyAI dilewati. File .md: %s",
-                         tag, sc["kind"], sc["name"], url)
-            except Exception as e:
-                write_err(f"ERROR (simpan file .md) - {name}: {e}")
+            log.info("%s Transkrip sudah ada di Drive (%s: %s) - dipakai, AssemblyAI dilewati", tag, sc["kind"], sc["name"])
+            submit_part(job, idx, text=body, source=f"file transkrip di Drive - {sc['name']}")
             return
 
     if video.get("can_download") is False:
         sa = getattr(creds, "service_account_email", "service account")
-        write_err(f"ERROR (tidak boleh di-download) - {name}: pemilik/admin membatasi download untuk akun ini "
+        fail_part(f"ERROR (tidak boleh di-download) - {name}: pemilik/admin membatasi download untuk akun ini "
                   f"(kemampuan 'canDownload' = false). Minta pemilik mengizinkan download, atau beri akses "
                   f"Editor ke {sa}. Video ini dilewati; video lain tetap diproses.")
         return
@@ -1181,9 +1239,11 @@ def process_one_video(creds, drive, video, idx, total, sheet_id, tab_name, row, 
 
         state["stage"] = "submit AssemblyAI"
         log.info("%s Tahap 3/3 Submit job (via webhook)...", tag)
-        params = {"sheet_id": sheet_id, "tab_name": tab_name, "row": row, "col": col,
-                  "idx": idx, "total": total, "label": name,
-                  "cand": cand, "proj": proj, "src": src_video}
+        # job/idx/total: untuk menggabungkan semua video satu baris ke satu file .md.
+        # candidate/project/label ikut dikirim sebagai cadangan kalau job di memori hilang (restart).
+        params = {"job": job.id, "idx": idx, "total": total, "sheet_id": job.sheet_id,
+                  "tab_name": job.tab_name, "row": job.row, "col": job.col,
+                  "candidate": job.candidate, "project": job.project, "label": name}
         webhook_url = f"{BASE_URL}/webhook?{urlencode(params)}"
         submit_resp = requests.post(
             "https://api.assemblyai.com/v2/transcript",
@@ -1201,27 +1261,21 @@ def process_one_video(creds, drive, video, idx, total, sheet_id, tab_name, row, 
         submit_resp.raise_for_status()
         log.info("%s Tahap 3/3 OK - job id=%s, menunggu webhook", tag, submit_resp.json().get("id"))
     except Exception as e:
-        write_err(f"ERROR ({state['stage']}) - {name}: {e}")
-
-
-def finish_assemblyai(creds, transcript_id, sheet_id, tab_name, row, col, idx, total, title, cand, proj, src):
-    body = fetch_timestamped_transcript(transcript_id)
-    return deliver_transcript(creds, sheet_id, tab_name, row, col, idx, total, title, body, cand, proj,
-                              src_video=src,
-                              src_note=f"AssemblyAI (Universal-2, bahasa {TRANSCRIPT_LANGUAGE_CODE})")
+        fail_part(f"ERROR ({state['stage']}) - {name}: {e}")
 
 
 @app.get("/manual-recover")
-def manual_recover(transcript_id: str, sheet_id: str, row: int, tab_name: str = "Sheet1",
-                   col: str = "G", label: str = "", token: str = "",
-                   idx: int = 1, total: int = 1, cand: str = "", proj: str = "", src: str = ""):
+def manual_recover(transcript_id: str, sheet_id: str, row: int, candidate: str, project: str,
+                   tab_name: str = "Initial Assessment V.3", col: str = "H", label: str = "",
+                   token: str = ""):
     """Endpoint darurat: tarik ulang transkrip yang sudah 'completed' di AssemblyAI
-    tapi webhook-nya gagal nyampe. Dipanggil manual lewat browser."""
+    tapi webhook-nya gagal nyampe. Dipanggil manual lewat browser.
+    Membuat/memperbarui file .md kandidat HANYA dengan satu transkrip ini (jadi kalau barisnya
+    punya beberapa video, jalankan ulang barisnya lewat menu, bukan lewat endpoint ini)."""
     if not APP_SECRET_TOKEN or token != APP_SECRET_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     creds = get_credentials()
-    title = label or f"video {idx}"
     try:
         r = requests.get(
             f"https://api.assemblyai.com/v2/transcript/{transcript_id}",
@@ -1231,14 +1285,63 @@ def manual_recover(transcript_id: str, sheet_id: str, row: int, tab_name: str = 
         r.raise_for_status()
         status = r.json().get("status")
         if status != "completed":
-            update_slot(creds, sheet_id, tab_name, row, col, idx, total,
-                        f"ERROR (status AssemblyAI: {status}) - {title}")
+            write_cell(creds, sheet_id, tab_name, row, col, f"ERROR (status AssemblyAI: {status})")
             return {"ok": False, "status": status}
-        url, n = finish_assemblyai(creds, transcript_id, sheet_id, tab_name, row, col, idx, total,
-                                   title, cand, proj, src)
-        return {"ok": True, "chars": n, "url": url}
+        text = fetch_timestamped_transcript(transcript_id)
+        job = RowJob(uuid.uuid4().hex[:12],
+                     [{"path": label or f"AssemblyAI {transcript_id}", "link": ""}], "",
+                     candidate.strip(), project.strip(), sheet_id, tab_name, row, col.upper())
+        submit_part(job, 1, text=text, source="AssemblyAI (pemulihan manual)")
+        return job.result or {"ok": False, "error": "job tidak selesai"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def handle_webhook(q, body):
+    """Dijalankan di threadpool (banyak panggilan jaringan) supaya event loop tidak tersumbat."""
+    sheet_id = q.get("sheet_id")
+    tab_name = q.get("tab_name", "Initial Assessment V.3")
+    row = int(q.get("row", 0))
+    col = q.get("col", "H")
+    label = q.get("label", "")
+    job_id = q.get("job", "")
+    idx = int(q.get("idx", 1))
+    total = int(q.get("total", 1))
+    candidate, project = q.get("candidate", "").strip(), q.get("project", "").strip()
+
+    transcript_id = body.get("transcript_id")
+    status = body.get("status")
+    log.info("[WEBHOOK] row=%s kolom=%s video=%s/%s transcript_id=%s status=%s",
+             row, col, idx, total, transcript_id, status)
+
+    creds = get_credentials()
+    job = get_job(job_id) if job_id else None
+    if job is None:
+        if total == 1 and candidate and project:
+            # Job di memori hilang (restart) tapi barisnya cuma satu video: bangun ulang dari parameter URL.
+            log.warning("[WEBHOOK] job %s tidak ada di memori - dibangun ulang dari parameter webhook", job_id)
+            job = RowJob(job_id or uuid.uuid4().hex[:12], [{"path": label or "video", "link": ""}], "",
+                         candidate, project, sheet_id, tab_name, row, col)
+        else:
+            msg = ("ERROR: backend sempat restart di tengah proses sehingga hasil baris ini tidak bisa "
+                   "digabung. Kosongkan sel ini lalu jalankan ulang barisnya.")
+            log.error("[WEBHOOK] %s (job=%s, video %s/%s)", msg, job_id, idx, total)
+            write_cell(creds, sheet_id, tab_name, row, col, msg)
+            return
+
+    if status != "completed":
+        detail = describe_failure(transcript_id, status)
+        label_part = f" - {label}" if label else ""
+        submit_part(job, idx, error=f"ERROR (AssemblyAI {status}){label_part}: {detail}")
+        return
+
+    try:
+        text = fetch_timestamped_transcript(transcript_id)
+    except Exception as e:
+        log.error("[WEBHOOK] Gagal ambil hasil: %s", e)
+        submit_part(job, idx, error=f"ERROR (ambil hasil transkrip) - {label}: {e}")
+        return
+    submit_part(job, idx, text=text, source="AssemblyAI (Universal-2)")
 
 
 @app.post("/webhook")
@@ -1247,44 +1350,6 @@ async def webhook(request: Request):
         log.warning("[WEBHOOK] Ditolak - secret nggak cocok")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    q = request.query_params
-    sheet_id = q.get("sheet_id")
-    tab_name = q.get("tab_name", "Sheet1")
-    row = int(q.get("row", 0))
-    col = q.get("col", "G")
-    idx = int(q.get("idx", 1) or 1)
-    total = int(q.get("total", 1) or 1)
-    title = q.get("label", "") or f"video {idx}"
-    cand = q.get("cand", "")
-    proj = q.get("proj", "")
-    src = q.get("src", "")
-
     body = await request.json()
-    transcript_id = body.get("transcript_id")
-    status = body.get("status")
-    log.info("[WEBHOOK] row=%s kolom=%s video=%s/%s transcript_id=%s status=%s",
-             row, col, idx, total, transcript_id, status)
-
-    def work():
-        try:
-            creds = get_credentials()
-            if status != "completed":
-                detail = describe_failure(transcript_id, status)
-                update_slot(creds, sheet_id, tab_name, row, col, idx, total,
-                            f"ERROR (AssemblyAI {status}) - {title}: {detail}")
-                return
-            try:
-                url, n = finish_assemblyai(creds, transcript_id, sheet_id, tab_name, row, col, idx, total,
-                                           title, cand, proj, src)
-                log.info("[WEBHOOK] SELESAI - file .md: %s (baris %s, video %s/%s)", url, row, idx, total)
-            except Exception as e:
-                log.error("[WEBHOOK] Gagal ambil/simpan hasil: %s", e)
-                update_slot(creds, sheet_id, tab_name, row, col, idx, total,
-                            f"ERROR (ambil/simpan transkrip) - {title}: {e}")
-        except Exception as e:
-            log.error("[WEBHOOK] error tak terduga: %s", e)
-
-    # Dijalankan di thread terpisah supaya AssemblyAI langsung dapat balasan 200
-    # (menyimpan .md lewat Web App bisa makan beberapa detik; webhook yang lambat memicu pengiriman ulang).
-    threading.Thread(target=work, daemon=True, name=f"webhook-{row}-{idx}").start()
+    await run_in_threadpool(handle_webhook, dict(request.query_params), body)
     return {"ok": True}
