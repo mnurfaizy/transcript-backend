@@ -1,35 +1,30 @@
 """
-Backend transkripsi video (Drive + YouTube) -> tulis hasil ke Google Sheet.
+Backend transkripsi video Drive -> AssemblyAI -> tulis hasil ke Google Sheet.
 
-Input boleh berupa link file video / folder Drive (subfolder dicari rekursif) dan
-link video / playlist YouTube. Satu permintaan = satu baris sheet.
+Input `file_id` boleh berupa ID FILE video ATAU ID FOLDER Drive:
+  Case 1: link langsung ke satu video
+  Case 2: link folder berisi beberapa video (file non-video dilewati, bukan error)
+  Case 3: link folder yang videonya ada di subfolder (dicari rekursif,
+          sampai kedalaman MAX_FOLDER_DEPTH)
 
-HASIL: SEMUA video dari satu baris ditulis di SATU SEL (`output_col`), dengan format:
+Hasil: satu video = satu file Markdown (.md), disimpan lewat Web App Apps Script milik
+satu akun Google (folder Talent Assessment/<project>/). Di sheet, HANYA SATU SEL
+(`output_col`, mis. kolom G) yang ditulis: satu baris per video, berformat
+    [k/N] Judul video: https://drive.google.com/file/d/.../view     (selesai)
+    [k/N] Diproses: ... / [k/N] ERROR (...) ...                       (status)
+`max_videos` kini hanya batas jumlah video per baris (pengaman kredit), BUKAN jumlah kolom.
 
-    -- Judul video 1, link video 1 --
-    [00:00] transkrip ...
+Alur:
+  POST /transcribe (dari Apps Script, header Authorization: Bearer <APP_SECRET_TOKEN>)
+    -> langsung balas "diterima", lalu di background:
+       Resolve : cek file/folder, kumpulkan daftar video
+       Per video (satu per satu): ambil video/audio -> upload AssemblyAI -> submit job + webhook
+       (video kecil di-download utuh; video besar cukup diekstrak audionya lewat ffmpeg)
+  POST /webhook (dipanggil AssemblyAI per video yang selesai)
+    -> ambil transkrip ber-timestamp, simpan sebagai .md (Web App), tulis link-nya ke sel
 
-    -- Judul video 2, link video 2 --
-    [00:00] transkrip ...
-
-Video Drive selesai lewat webhook AssemblyAI (urutan selesai bisa acak), video YouTube
-selesai langsung. Karena itu setiap video hanya mengganti BLOK-nya sendiri di dalam sel
-(baca sel -> ganti blok yang linknya cocok -> tulis balik, dilindungi lock per sel).
-Sel sheet sendiri menjadi penyimpan status, jadi aman kalau instance Render restart.
-
-Batas 50.000 karakter per sel Google Sheets:
-  Tiap video mendapat jatah karakter (batas sel dibagi jumlah video). Kalau transkripnya
-  lebih panjang, bagian yang muat tetap tampil di sel dan SISANYA disimpan utuh di tab
-  "Transkrip Lengkap" (dibuat otomatis) dengan penanda [TERPOTONG ... kunci: XXXX] di sel.
-  Apps Script menyambungkan kembali teks lengkapnya saat Sync ke Coda.
-
-Status per blok:
-  "Diproses: ..."  -> masih berjalan
-  "ERROR (...)"    -> video itu gagal (video lain tetap jalan)
-  selain itu       -> transkrip selesai
-Status seluruh sel (tanpa blok): "ERROR: ..." atau "Tidak ada video: ...".
-
-Detail lengkap tiap tahap ada di tab "Logs" Render.
+Kalau ada tahap yang gagal, pesan error ditulis di baris video terkait (video lain
+tetap jalan). Detail lengkap ada di tab "Logs" Render.
 """
 
 import os
@@ -44,7 +39,7 @@ import subprocess
 import tempfile
 import threading
 import time
-import uuid
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode, urlparse, parse_qs
 
 from fastapi import FastAPI, Request, HTTPException
@@ -91,7 +86,6 @@ DRIVE_MEDIA_URL = "https://www.googleapis.com/drive/v3/files/{file_id}?alt=media
 
 # --- YouTube: transkrip diambil dari caption lewat Apify (satu video per panggilan);
 #     playlist diperluas dulu jadi daftar video lewat YouTube Data API v3 (gratis, butuh API key).
-#     API key yang sama juga dipakai untuk mengambil JUDUL video yang dikirim lewat link langsung.
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN")
 APIFY_ACTOR = os.environ.get("APIFY_ACTOR", "pintostudio~youtube-transcript-scraper")
 YT_TRANSCRIPT_LANG = os.environ.get("YT_TRANSCRIPT_LANG", "id")
@@ -99,7 +93,6 @@ YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 YT_PARAGRAPH_SECONDS = 30   # caption digabung jadi paragraf tiap ~30 detik, diawali [MM:SS]
 APIFY_RUN_URL = "https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items"
 YOUTUBE_PLAYLIST_URL = "https://www.googleapis.com/youtube/v3/playlistItems"
-YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
 
 # Batas keras jumlah video per permintaan (pengaman kredit AssemblyAI).
@@ -114,15 +107,22 @@ VIDEO_EXTENSIONS = {
     ".mpeg", ".mpg", ".mts", ".m2ts", ".mxf", ".3gp",
 }
 
+# --- Transkrip yang SUDAH ADA di Drive (file di folder yang sama dengan videonya, mis. transkrip
+#     Google Meet berupa Google Doc, atau .vtt/.srt/.txt dari Zoom). Kalau ada dan cocok dengan yakin,
+#     dipakai langsung (tanpa AssemblyAI). Matikan dengan Environment Variable USE_DRIVE_TRANSCRIPTS=0.
+USE_DRIVE_TRANSCRIPTS = os.environ.get("USE_DRIVE_TRANSCRIPTS", "1") != "0"
+GDOC_MIME = "application/vnd.google-apps.document"
+SIDECAR_RANK = {"vtt": 0, "srt": 1, "gdoc": 2, "txt": 3}   # makin kecil makin diutamakan
+TRANSCRIPT_HINT = re.compile(r"transcript|transkrip|caption|subtitle", re.I)
+MIN_TRANSCRIPT_CHARS = 30
+
 # Batas Google Sheets: 50.000 karakter per sel.
 MAX_CELL_CHARS = 49000
-MIN_VIDEO_CAP = 1500          # jatah minimum per video (aman untuk maks 20 video)
-CAP_MARGIN = 250              # ruang untuk penanda [TERPOTONG ...] / [PERINGATAN ...]
 
-# Tab penampung sisa transkrip yang tidak muat di sel. Harus sama dengan
-# CONFIG.TRANSCRIPT.OVERFLOW_TAB di Apps Script.
-OVERFLOW_TAB = "Transkrip Lengkap"
-OVERFLOW_CHUNK = 45000
+# --- Penyimpanan hasil: file .md dibuat oleh Web App Apps Script (berjalan atas nama pemilik
+#     folder Talent Assessment), karena service account tidak punya kuota Drive sendiri.
+WEBAPP_URL = os.environ.get("WEBAPP_URL")       # URL "/exec" Web App penerima
+WEBAPP_TOKEN = os.environ.get("WEBAPP_TOKEN")   # sama persis dengan Script Property WEBAPP_TOKEN di Web App
 
 
 class TranscribeRequest(BaseModel):
@@ -132,8 +132,10 @@ class TranscribeRequest(BaseModel):
     sheet_id: str
     tab_name: str = "Sheet1"
     row: int
-    output_col: str = "B"   # kolom TUNGGAL untuk hasil (semua video digabung di sini)
-    max_videos: int = 1     # batas jumlah video per baris (maks HARD_CAP_VIDEOS)
+    output_col: str = "B"   # kolom pertama untuk hasil
+    max_videos: int = 1     # batas jumlah video per baris (pengaman kredit)
+    candidate_name: str = ""   # nama kandidat (kolom A) -> dipakai untuk nama file .md
+    project: str = ""          # nama project (kolom D) -> menentukan subfolder tujuan
 
 
 # ---------------------------------------------------------------- helper umum
@@ -143,6 +145,21 @@ def get_credentials():
     return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
 
 
+def col_to_num(letters):
+    n = 0
+    for ch in letters.upper():
+        n = n * 26 + (ord(ch) - 64)
+    return n
+
+
+def num_to_col(n):
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
 def a1(tab_name, col, row):
     # Nama tab berspasi (mis. "Initial Assessment") wajib dikutip di notasi A1.
     safe_tab = tab_name.replace("'", "''")
@@ -150,8 +167,6 @@ def a1(tab_name, col, row):
 
 
 def fit_cell(text):
-    """Pengaman terakhir. Kondisi normal tidak pernah sampai sini karena tiap video sudah
-    dibatasi jatahnya (lihat per_video_cap / fit_body)."""
     if len(text) <= MAX_CELL_CHARS:
         return text
     cut = text[:MAX_CELL_CHARS]
@@ -159,7 +174,7 @@ def fit_cell(text):
     if idx > MAX_CELL_CHARS * 0.8:
         cut = cut[:idx]
     hilang = len(text) - len(cut)
-    return (cut + "\n\n[TERPOTONG: isi sel melebihi batas 50.000 karakter per sel "
+    return (cut + "\n\n[TERPOTONG: transkrip melebihi batas 50.000 karakter per sel "
             f"Google Sheets. {hilang} karakter terakhir tidak ditampilkan.]")
 
 
@@ -173,13 +188,16 @@ def write_cell(creds, sheet_id, tab_name, row, col, text):
     ).execute()
 
 
-def read_cell(creds, sheet_id, tab_name, row, col):
+def write_block(creds, sheet_id, tab_name, row, start_col, texts):
+    end_col = num_to_col(col_to_num(start_col) + len(texts) - 1)
+    rng = a1(tab_name, start_col, row) + f":{end_col}{row}"
     sheets = build("sheets", "v4", credentials=creds)
-    resp = sheets.spreadsheets().values().get(
-        spreadsheetId=sheet_id, range=a1(tab_name, col, row)
+    sheets.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=rng,
+        valueInputOption="RAW",
+        body={"values": [[fit_cell(t) for t in texts]]},
     ).execute()
-    vals = resp.get("values") or []
-    return str(vals[0][0]) if vals and vals[0] else ""
 
 
 def format_timestamp_ms(ms):
@@ -207,6 +225,11 @@ def fetch_timestamped_transcript(transcript_id):
     return "\n\n".join(lines)
 
 
+def build_cell_text(transcript_id, label):
+    body = fetch_timestamped_transcript(transcript_id)
+    return f"== {label} ==\n\n{body}" if label else body
+
+
 def describe_failure(transcript_id, status):
     try:
         r = requests.get(
@@ -219,157 +242,115 @@ def describe_failure(transcript_id, status):
         return status
 
 
-# ------------------------------------------- blok video di dalam SATU sel
+# ------------------------- hasil -> file .md (Web App) + status per video di SATU sel
 
-HEADER_RE = re.compile(r"^-- .+ --$")
-
-
-def clean_title(t):
-    return re.sub(r"\s+", " ", str(t or "")).strip()
+SLOT_RE = re.compile(r"^\[(\d+)/(\d+)\]\s")
+_SLOT_LOCK = threading.Lock()   # webhook beberapa video bisa datang bersamaan -> baca-ubah-tulis sel harus bergantian
+WIB = timezone(timedelta(hours=7))
 
 
-def make_header(title, link):
-    return f"-- {clean_title(title) or link}, {link} --"
+def one_line(text, limit=600):
+    s = re.sub(r"\s+", " ", str(text)).strip()
+    return s if len(s) <= limit else s[:limit - 1] + "…"
 
 
-def parse_blocks(text):
-    """Isi sel -> [(header, body), ...]. Baris pembuka blok = baris berbentuk '-- ... --'.
-    Teks tanpa header (mis. pesan 'ERROR: ...' seluruh sel) menghasilkan daftar kosong."""
-    blocks, cur = [], None
-    for line in str(text or "").split("\n"):
-        if HEADER_RE.match(line):
-            cur = [line, []]
-            blocks.append(cur)
-        elif cur is not None:
-            cur[1].append(line)
-    return [(h, "\n".join(body).strip("\n")) for h, body in blocks]
-
-
-def render_blocks(blocks):
-    return "\n\n".join(h + ("\n" + b if b else "") for h, b in blocks)
-
-
-def replace_block(blocks, header, link, body):
-    """Ganti blok yang linknya cocok; kalau tidak ada, tambahkan di akhir."""
-    suffix = f", {link} --"
-    out = list(blocks)
-    for i, (h, _) in enumerate(out):
-        if h.endswith(suffix):
-            out[i] = (header, body)
-            return out
-    out.append((header, body))
-    return out
-
-
-_CELL_LOCKS = {}
-_CELL_LOCKS_GUARD = threading.Lock()
-
-
-def cell_lock(sheet_id, tab_name, row, col):
-    key = (sheet_id, tab_name, row, col)
-    with _CELL_LOCKS_GUARD:
-        return _CELL_LOCKS.setdefault(key, threading.Lock())
-
-
-def set_block(creds, sheet_id, tab_name, row, col, header, link, body):
-    """Ganti isi satu blok video tanpa menyentuh blok lain (baca-ubah-tulis, dengan lock)."""
-    with cell_lock(sheet_id, tab_name, row, col):
-        current = read_cell(creds, sheet_id, tab_name, row, col)
-        blocks = replace_block(parse_blocks(current), header, link, body)
-        write_cell(creds, sheet_id, tab_name, row, col, render_blocks(blocks))
-
-
-def set_all_blocks(creds, sheet_id, tab_name, row, col, blocks):
-    with cell_lock(sheet_id, tab_name, row, col):
-        write_cell(creds, sheet_id, tab_name, row, col, render_blocks(blocks))
-
-
-def per_video_cap(headers):
-    """Jatah karakter transkrip per video supaya seluruh blok muat di satu sel."""
-    n = max(1, len(headers))
-    overhead = sum(len(h) for h in headers) + n * 4
-    return max(MIN_VIDEO_CAP, (MAX_CELL_CHARS - overhead) // n - CAP_MARGIN)
-
-
-# ------------------------------------------- overflow: sisa transkrip panjang
-
-_OVERFLOW_READY = set()
-_OVERFLOW_LOCK = threading.Lock()
-
-
-def ensure_overflow_tab(sheets, sheet_id):
-    with _OVERFLOW_LOCK:
-        if sheet_id in _OVERFLOW_READY:
-            return
-        meta = sheets.spreadsheets().get(
-            spreadsheetId=sheet_id, fields="sheets.properties.title"
-        ).execute()
-        titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
-        if OVERFLOW_TAB not in titles:
-            sheets.spreadsheets().batchUpdate(
-                spreadsheetId=sheet_id,
-                body={"requests": [{"addSheet": {"properties": {"title": OVERFLOW_TAB}}}]},
-            ).execute()
-            sheets.spreadsheets().values().update(
-                spreadsheetId=sheet_id,
-                range=a1(OVERFLOW_TAB, "A", 1) + ":C1",
-                valueInputOption="RAW",
-                body={"values": [["kunci", "bagian", "teks (JANGAN diubah/dihapus sebelum Sync ke Coda)"]]},
-            ).execute()
-            log.info("[Overflow] tab '%s' dibuat", OVERFLOW_TAB)
-        _OVERFLOW_READY.add(sheet_id)
-
-
-def save_overflow(creds, sheet_id, key, rest):
+def read_cell(creds, sheet_id, tab_name, col, row):
     sheets = build("sheets", "v4", credentials=creds)
-    ensure_overflow_tab(sheets, sheet_id)
-    rows = [[key, i, rest[p:p + OVERFLOW_CHUNK]]
-            for i, p in enumerate(range(0, len(rest), OVERFLOW_CHUNK))]
-    sheets.spreadsheets().values().append(
-        spreadsheetId=sheet_id,
-        range=f"'{OVERFLOW_TAB}'!A:C",
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": rows},
-    ).execute()
+    res = sheets.spreadsheets().values().get(
+        spreadsheetId=sheet_id, range=a1(tab_name, col, row)).execute()
+    vals = res.get("values") or []
+    return vals[0][0] if vals and vals[0] else ""
 
 
-def fit_body(creds, sheet_id, key, text, cap):
-    """Transkrip <= jatah: tampil utuh. Lebih panjang: potong di batas paragraf, sisanya
-    disimpan ke tab overflow, dan sel diberi penanda [TERPOTONG ... kunci: KEY]."""
-    if len(text) <= cap:
-        return text
-    cut = text.rfind("\n\n", 0, cap)
-    if cut < cap * 0.5:
-        cut = cap
-    inline, rest = text[:cut], text[cut:]
-    try:
-        save_overflow(creds, sheet_id, key, rest)
-    except Exception as e:
-        log.error("[Overflow] gagal menyimpan sisa transkrip (%s): %s", key, e)
-        why = str(e).replace("\n", " ").replace("]", ")")[:150]
-        return (inline + f"\n\n[TERPOTONG: {len(rest)} karakter terakhir TIDAK tersimpan "
-                f"(gagal menulis ke tab '{OVERFLOW_TAB}': {why})]")
-    log.info("[Overflow] %s: %d karakter tampil di sel, %d karakter disimpan di tab '%s'",
-             key, len(inline), len(rest), OVERFLOW_TAB)
-    return inline + f'\n\n[TERPOTONG - lanjutan teks ada di tab "{OVERFLOW_TAB}", kunci: {key}]'
+def parse_slots(text):
+    slots, warns = {}, []
+    for line in str(text).split("\n"):
+        m = SLOT_RE.match(line)
+        if m:
+            slots[int(m.group(1))] = line
+        elif line.startswith("PERINGATAN:"):
+            warns.append(line)
+    return slots, warns
 
 
-def put_transcript(creds, sheet_id, tab_name, row, col, link, title, job, idx, cap, text, warn=""):
-    if not link:   # job lama tanpa link: perilaku lama (tulis seluruh sel)
-        write_cell(creds, sheet_id, tab_name, row, col, text)
-        return
-    body = fit_body(creds, sheet_id, f"{job or uuid.uuid4().hex[:10]}-{idx}", text, cap)
+def render_slots(slots, total, warns):
+    lines = list(warns)
+    for i in range(1, total + 1):
+        lines.append(slots.get(i, f"[{i}/{total}] Diproses: menunggu"))
+    return "\n".join(lines)
+
+
+def init_slots(creds, sheet_id, tab_name, row, col, total, texts, warn=""):
+    """Tulis status awal semua video sekaligus (menimpa isi sel)."""
+    lines = []
     if warn:
-        body = f"[PERINGATAN: {warn}]\n\n{body}"
-    set_block(creds, sheet_id, tab_name, row, col, make_header(title, link), link, body)
+        lines.append("PERINGATAN: " + one_line(warn, 800))
+    lines += [f"[{i + 1}/{total}] {one_line(t)}" for i, t in enumerate(texts)]
+    with _SLOT_LOCK:
+        write_cell(creds, sheet_id, tab_name, row, col, "\n".join(lines))
 
 
-def put_error(creds, sheet_id, tab_name, row, col, link, title, msg):
-    if not link:
-        write_cell(creds, sheet_id, tab_name, row, col, msg)
-        return
-    set_block(creds, sheet_id, tab_name, row, col, make_header(title, link), link, msg)
+def update_slot(creds, sheet_id, tab_name, row, col, idx, total, text):
+    """Ubah baris video ke-idx saja; baris video lain dipertahankan."""
+    line = f"[{idx}/{total}] {one_line(text)}"
+    with _SLOT_LOCK:
+        try:
+            current = read_cell(creds, sheet_id, tab_name, col, row)
+        except Exception as e:
+            log.warning("Gagal membaca sel sebelum update (%s) - memakai sel kosong", e)
+            current = ""
+        slots, warns = parse_slots(current)
+        slots[idx] = line
+        write_cell(creds, sheet_id, tab_name, row, col, render_slots(slots, total, warns))
+
+
+def compose_md(title, body, cand, proj, src_video="", src_note=""):
+    meta = []
+    if cand:
+        meta.append(f"- Kandidat: {cand}")
+    if proj:
+        meta.append(f"- Project: {proj}")
+    if src_video:
+        meta.append(f"- Video: {src_video}")
+    if src_note:
+        meta.append(f"- Sumber transkrip: {src_note}")
+    meta.append(f"- Dibuat: {datetime.now(WIB).strftime('%Y-%m-%d %H:%M')} WIB")
+    return f"# Transkrip: {one_line(title, 300)}\n\n" + "\n".join(meta) + "\n\n---\n\n" + body.strip() + "\n"
+
+
+def save_markdown(title, content, cand, proj):
+    """Kirim ke Web App Apps Script -> file .md di Drive -> kembalikan URL file.
+    Aman diulang: nama file yang sama ditimpa, bukan diduplikasi."""
+    if not WEBAPP_URL or not WEBAPP_TOKEN:
+        raise RuntimeError("WEBAPP_URL / WEBAPP_TOKEN belum di-set di Environment Variable Render")
+    payload = {"token": WEBAPP_TOKEN, "candidate": cand, "project": proj,
+               "title": title, "content": content}
+    last = None
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(WEBAPP_URL, json=payload, timeout=180)
+            try:
+                data = r.json()
+            except ValueError:
+                raise RuntimeError(f"Web App membalas bukan JSON (status {r.status_code}). Cek deployment: "
+                                   f"'Execute as: Me' + akses 'Anyone'. Awal balasan: {r.text[:120]!r}")
+            if not data.get("ok"):
+                raise RuntimeError(f"Web App menolak: {data.get('error')}")
+            return data["url"]
+        except Exception as e:
+            last = e
+            log.warning("[save_markdown] percobaan %d/3 gagal: %s", attempt, e)
+            if attempt < 3:
+                time.sleep(3 * attempt)
+    raise last
+
+
+def deliver_transcript(creds, sheet_id, tab_name, row, col, idx, total, title, body, cand, proj,
+                       src_video="", src_note=""):
+    md = compose_md(title, body, cand, proj, src_video, src_note)
+    url = save_markdown(title, md, cand, proj)
+    update_slot(creds, sheet_id, tab_name, row, col, idx, total, f"{title}: {url}")
+    return url, len(md)
 
 
 # ------------------------------------------------ pencarian video di Drive
@@ -412,6 +393,103 @@ def list_children(drive, folder_id):
     return items
 
 
+def make_video(item, path):
+    return {"id": item["id"], "name": item["name"], "path": path, "size": to_int(item.get("size")),
+            "can_download": (item.get("capabilities") or {}).get("canDownload")}
+
+
+def transcript_kind(name, mime):
+    """Jenis file transkrip: 'vtt' | 'srt' | 'txt' | 'gdoc' | None. Google Doc dianggap transkrip
+    hanya kalau namanya menyebut transcript/transkrip/caption/subtitle."""
+    if mime == GDOC_MIME:
+        return "gdoc" if TRANSCRIPT_HINT.search(name) else None
+    ext = os.path.splitext(name.lower())[1]
+    if ext == ".vtt" or mime == "text/vtt":
+        return "vtt"
+    if ext == ".srt" or mime == "application/x-subrip":
+        return "srt"
+    if ext == ".txt":
+        return "txt"
+    return None
+
+
+_NAME_NOISE = re.compile(r"\b(closed caption|recording|transcript|transkrip|captions?|subtitles?|audio|video|cc)\b")
+_LANG_TAIL = re.compile(r"\b(id|en|ind|indonesia|indonesian|english)$")
+
+
+def norm_name(name):
+    """Nama disederhanakan supaya 'X - Recording.mp4' dan 'X - Transcript' (atau
+    'GMT..._Recording_1920x1080.mp4' dan 'GMT..._Recording.transcript.vtt') dianggap sama."""
+    base = re.sub(r"\.(mp4|mov|mkv|webm|m4v|avi|wmv|flv|mpeg|mpg|mts|m2ts|mxf|3gp|vtt|srt|txt|sbv)$", "", name, flags=re.I)
+    base = re.sub(r"\.(transcript|captions?|subtitles?)$", "", base, flags=re.I)
+    base = re.sub(r"\d{3,4}x\d{3,4}", " ", base)
+    base = re.sub(r"[\W_]+", " ", base.lower()).strip()
+    base = _NAME_NOISE.sub(" ", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    return _LANG_TAIL.sub("", base).strip()
+
+
+def classify_items(items, prefix=""):
+    """Isi satu folder -> (subfolder, video, kandidat file transkrip, item lain yang dilewati)."""
+    folders, vids, cands, others = [], [], [], []
+    for item in items:
+        name, mime = item["name"], item.get("mimeType", "")
+        path = prefix + name
+        if mime == FOLDER_MIME:
+            folders.append((item, path))
+        elif is_video(name, mime):
+            vids.append(make_video(item, path))
+        else:
+            kind = transcript_kind(name, mime) if USE_DRIVE_TRANSCRIPTS else None
+            if kind:
+                cands.append({"id": item["id"], "name": name, "kind": kind, "path": path,
+                              "strong": kind in ("vtt", "srt") or bool(TRANSCRIPT_HINT.search(name))})
+            else:
+                others.append(f"{path} ({mime})")
+    return folders, vids, cands, others
+
+
+def attach_sidecars(videos, cands):
+    """Pasangkan video dengan file transkrip dari SATU folder yang sama. Hanya pasangan yang yakin:
+    (1) nama sama setelah dinormalisasi, atau (2) satu-satunya video di folder itu dan ada tepat satu
+    kandidat 'kuat' (.vtt/.srt atau nama menyebut transcript) dengan prioritas tertinggi.
+    Ragu-ragu = tidak dipasangkan, dan video jatuh ke AssemblyAI."""
+    if not videos or not cands:
+        return
+    by_key = {}
+    for c in cands:
+        key = norm_name(c["name"])
+        if key:
+            by_key.setdefault(key, []).append(c)
+    for v in videos:
+        pool = by_key.get(norm_name(v["name"]) or "\0")
+        if pool:
+            best = min(SIDECAR_RANK[c["kind"]] for c in pool)
+            top = [c for c in pool if SIDECAR_RANK[c["kind"]] == best]
+            if len(top) == 1:
+                v["sidecar"] = top[0]
+    if len(videos) == 1 and "sidecar" not in videos[0]:
+        strong = [c for c in cands if c["strong"]]
+        if strong:
+            best = min(SIDECAR_RANK[c["kind"]] for c in strong)
+            top = [c for c in strong if SIDECAR_RANK[c["kind"]] == best]
+            if len(top) == 1:
+                videos[0]["sidecar"] = top[0]
+
+
+def attach_sidecar_from_parent(drive, video, parent_id):
+    """Link langsung ke satu video: cari file transkrip di folder induknya (kalau folder itu bisa dibaca)."""
+    try:
+        _, vids, cands, _ = classify_items(list_children(drive, parent_id))
+    except Exception as e:
+        log.info("[Resolve] folder induk tidak bisa dibaca, pencarian transkrip Drive dilewati: %s", e)
+        return
+    attach_sidecars(vids, cands)
+    for v in vids:
+        if v["id"] == video["id"] and v.get("sidecar"):
+            video["sidecar"] = v["sidecar"]
+
+
 def collect_videos(drive, root_id, prefix=""):
     """Telusuri folder (dan subfolder) -> (daftar video, daftar item yang dilewati)."""
     videos, skipped, visited = [], [], set()
@@ -421,19 +499,18 @@ def collect_videos(drive, root_id, prefix=""):
         if folder_id in visited:
             continue
         visited.add(folder_id)
-        for item in list_children(drive, folder_id):
-            name, mime = item["name"], item.get("mimeType", "")
-            path = prefix + name
-            if mime == FOLDER_MIME:
-                if depth + 1 > MAX_FOLDER_DEPTH:
-                    skipped.append(f"{path}/ (subfolder terlalu dalam)")
-                else:
-                    stack.append((item["id"], path + "/", depth + 1))
-            elif is_video(name, mime):
-                videos.append({"id": item["id"], "name": name, "path": path, "size": to_int(item.get("size")),
-                           "can_download": (item.get("capabilities") or {}).get("canDownload")})
+        folders, vids, cands, others = classify_items(list_children(drive, folder_id), prefix)
+        skipped.extend(others)
+        attach_sidecars(vids, cands)
+        used = {v["sidecar"]["id"] for v in vids if v.get("sidecar")}
+        skipped.extend(f"{c['path']} (file transkrip tidak terpasang ke video mana pun)"
+                       for c in cands if c["id"] not in used)
+        videos.extend(vids)
+        for item, path in folders:
+            if depth + 1 > MAX_FOLDER_DEPTH:
+                skipped.append(f"{path}/ (subfolder terlalu dalam)")
             else:
-                skipped.append(f"{path} ({mime})")
+                stack.append((item["id"], path + "/", depth + 1))
     videos.sort(key=lambda v: natural_key(v["path"]))
     return videos, skipped
 
@@ -454,7 +531,7 @@ def gather_videos(drive, root_ids, sa_email):
     for rid in root_ids:
         try:
             meta = drive.files().get(
-                fileId=rid, fields="id,name,mimeType,size,capabilities(canDownload)", supportsAllDrives=True
+                fileId=rid, fields="id,name,mimeType,size,parents,capabilities(canDownload)", supportsAllDrives=True
             ).execute()
         except Exception as e:
             log.warning("[Resolve] id=%s tidak bisa diakses: %s", rid, e)
@@ -466,8 +543,9 @@ def gather_videos(drive, root_ids, sa_email):
             found, skip = collect_videos(drive, rid, prefix=(name + "/") if multi else "")
             skipped.extend(skip)
         elif is_video(name, mime):
-            found = [{"id": meta["id"], "name": name, "path": name, "size": to_int(meta.get("size")),
-                      "can_download": (meta.get("capabilities") or {}).get("canDownload")}]
+            found = [make_video(meta, name)]
+            if USE_DRIVE_TRANSCRIPTS and meta.get("parents"):
+                attach_sidecar_from_parent(drive, found[0], meta["parents"][0])
         else:
             skipped.append(f"{name} ({mime})")
             continue
@@ -526,13 +604,15 @@ def transcribe(req: TranscribeRequest, request: Request):
         raise HTTPException(status_code=400, detail="tidak ada link Drive/YouTube")
     log.info("Request diterima: %d link Drive, %d link YouTube, tab=%s, row=%s, kolom=%s, maks_video=%s",
              len(root_ids), len(youtube_urls), req.tab_name, req.row, output_col, max_videos)
-    JOBS.put((root_ids, youtube_urls, req.sheet_id, req.tab_name, req.row, output_col, max_videos))
+    JOBS.put((root_ids, youtube_urls, req.sheet_id, req.tab_name, req.row, output_col, max_videos,
+              req.candidate_name.strip(), req.project.strip()))
     waiting = JOBS.qsize()
     log.info("[Antrean] baris %s masuk antrean (menunggu giliran: %d)", req.row, waiting)
     return {"status": "diterima, masuk antrean", "menunggu_di_depan": waiting}
 
 
-def process_request(root_ids, youtube_urls, sheet_id, tab_name, row, output_col, max_videos):
+def process_request(root_ids, youtube_urls, sheet_id, tab_name, row, output_col, max_videos,
+                    candidate="", project=""):
     try:
         creds = get_credentials()
         sa_email = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON).get("client_email", "service account")
@@ -564,45 +644,29 @@ def process_request(root_ids, youtube_urls, sheet_id, tab_name, row, output_col,
         log.info("[Resolve] Ditemukan %d video.%s", total, summarize_skipped(skipped))
 
         if total == 0:
-            if notes:   # ada link yang gagal diakses / dibaca -> ini masalah nyata
-                hint = (f" Untuk link Drive, pastikan sudah di-share ke {sa_email} (minimal Viewer)."
-                        if root_ids else "")
-                fail("ERROR: tidak ada video ditemukan. " + "; ".join(notes).rstrip(".") + "."
-                     + summarize_skipped(skipped) + hint)
-            else:       # link bisa diakses tapi memang bukan video (portfolio PDF, dsb.)
-                fail("Tidak ada video: link ini tidak berisi file video (file non-video dilewati)."
-                     + summarize_skipped(skipped))
+            detail = (" " + "; ".join(notes).rstrip(".") + ".") if notes else ""
+            hint = f" Untuk link Drive, pastikan sudah di-share ke {sa_email} (minimal Viewer)." if root_ids else ""
+            fail("ERROR: tidak ada video ditemukan." + detail + summarize_skipped(skipped) + hint)
             return
+
         if total > max_videos:
             fail(f"ERROR: ditemukan {total} video, melebihi batas {max_videos} video per baris. "
-                 "Naikkan MAX_VIDEOS_PER_ROW di Apps Script (maks 20) atau pisahkan link-nya.")
+                 f"Pecah folder/playlist-nya, atau naikkan MAX_VIDEOS_PER_ROW di Apps Script (maks {HARD_CAP_VIDEOS}).")
             return
 
-        # --- Judul + link + header tiap video, jatah karakter, dan id job
-        for v in videos:
-            if v.get("kind") == "youtube":
-                v["link"] = v["url"]
-            else:
-                v["link"] = f"https://drive.google.com/file/d/{v['id']}/view"
-            v["title"] = clean_title(v["name"] if v.get("kind") == "youtube" else v["path"])
-            v["header"] = make_header(v["title"], v["link"])
-        if notes:
-            videos[0]["warn"] = "; ".join(notes)  # tampil sebagai baris peringatan di blok video pertama
-        job = uuid.uuid4().hex[:10]
-        cap = per_video_cap([v["header"] for v in videos])
-        log.info("[Resolve] job=%s, jatah per video=%d karakter", job, cap)
-
-        # --- Placeholder: semua blok langsung tampil, lalu diganti satu per satu
-        set_all_blocks(creds, sheet_id, tab_name, row, output_col,
-                       [(v["header"], f"Diproses: [{i + 1}/{total}] dalam antrean")
-                        for i, v in enumerate(videos)])
+        # --- Status awal per video: SATU sel (kolom output_col), satu baris per video.
+        init_slots(creds, sheet_id, tab_name, row, output_col, total,
+                   [f"Diproses: {v['path']} - dalam antrean" for v in videos],
+                   "; ".join(notes))
 
         # --- Proses satu per satu (hemat RAM & disk di Render free)
         for i, video in enumerate(videos):
             if video.get("kind") == "youtube":
-                process_youtube_video(creds, video, i + 1, total, sheet_id, tab_name, row, output_col, job, cap)
+                process_youtube_video(creds, video, i + 1, total, sheet_id, tab_name, row, output_col,
+                                      candidate, project)
             else:
-                process_one_video(creds, drive, video, i + 1, total, sheet_id, tab_name, row, output_col, job, cap)
+                process_one_video(creds, drive, video, i + 1, total, sheet_id, tab_name, row, output_col,
+                                  candidate, project)
 
         log.info("[Selesai] Semua %d video diproses; transkrip video Drive menyusul lewat webhook.", total)
     except Exception as e:
@@ -677,29 +741,6 @@ def expand_playlist(playlist_id, limit=100):
     return items
 
 
-def fetch_youtube_titles(video_ids):
-    """Judul video untuk link langsung (bukan dari playlist). Gagal = judul kosong, bukan error."""
-    titles = {}
-    if not YOUTUBE_API_KEY or not video_ids:
-        return titles
-    for i in range(0, len(video_ids), 50):
-        chunk = video_ids[i:i + 50]
-        try:
-            r = requests.get(
-                YOUTUBE_VIDEOS_URL,
-                params={"part": "snippet", "id": ",".join(chunk), "key": YOUTUBE_API_KEY},
-                timeout=30,
-            )
-            if r.status_code == 200:
-                for it in r.json().get("items", []):
-                    titles[it["id"]] = (it.get("snippet") or {}).get("title", "")
-            else:
-                log.warning("[Resolve] YouTube videos API HTTP %s (judul dilewati)", r.status_code)
-        except requests.RequestException as e:
-            log.warning("[Resolve] YouTube videos API gagal: %s", str(e).replace(YOUTUBE_API_KEY, "***"))
-    return titles
-
-
 def gather_youtube(urls):
     """Link YouTube (video / playlist) -> daftar video + catatan masalah."""
     videos, notes, seen, private = [], [], set(), 0
@@ -723,15 +764,9 @@ def gather_youtube(urls):
             if vid in seen:
                 continue
             seen.add(vid)
-            videos.append({"kind": "youtube", "id": vid, "name": title or vid, "path": title or vid,
-                           "no_title": not title, "url": f"https://www.youtube.com/watch?v={vid}"})
-    # Judul untuk link video langsung (playlist sudah membawa judulnya sendiri)
-    missing = [v["id"] for v in videos if v.get("no_title")]
-    if missing:
-        titles = fetch_youtube_titles(missing)
-        for v in videos:
-            if v.get("no_title") and titles.get(v["id"]):
-                v["name"] = v["path"] = titles[v["id"]]
+            label = f"{title} (youtu.be/{vid})" if title else f"youtu.be/{vid}"
+            videos.append({"kind": "youtube", "id": vid, "name": title or vid, "path": label,
+                           "url": f"https://www.youtube.com/watch?v={vid}"})
     if private:
         notes.append(f"{private} video playlist private/terhapus dilewati")
     return videos, notes
@@ -753,12 +788,12 @@ def _clean_caption(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
-def format_youtube_segments(segments):
+def format_youtube_segments(segments, guess_units=True):
     """Segmen caption [{start, dur, text}] -> paragraf ~30 detik, diawali [MM:SS]."""
     groups = []  # [detik_mulai, [potongan teks]]
     # Pengaman satuan: waktu mulai di atas 10 jam hampir pasti berarti milidetik, bukan detik.
     starts = [_to_float(sg.get("start")) for sg in segments]
-    scale = 0.001 if starts and max(starts) > 36000 else 1.0
+    scale = 0.001 if (guess_units and starts and max(starts) > 36000) else 1.0
     for seg in segments:
         text = _clean_caption(str(seg.get("text", "")))
         if not text:
@@ -824,15 +859,14 @@ def fetch_youtube_transcript(video_url):
     return text
 
 
-def process_youtube_video(creds, video, idx, total, sheet_id, tab_name, row, col, job, cap):
+def process_youtube_video(creds, video, idx, total, sheet_id, tab_name, row, col, cand="", proj=""):
     tag = f"[Video {idx}/{total}]"
     name = video["path"]
-    link, title = video["link"], video["title"]
 
     def write_err(msg):
         log.error("%s %s", tag, msg)
         try:
-            put_error(creds, sheet_id, tab_name, row, col, link, title, msg)
+            update_slot(creds, sheet_id, tab_name, row, col, idx, total, msg)
         except Exception as e2:
             log.error("%s Gagal menulis pesan error ke sheet: %s", tag, e2)
 
@@ -840,14 +874,72 @@ def process_youtube_video(creds, video, idx, total, sheet_id, tab_name, row, col
         log.info("%s Ambil transkrip YouTube via Apify: %s", tag, name)
         t0 = time.time()
         text = fetch_youtube_transcript(video["url"])
-        put_transcript(creds, sheet_id, tab_name, row, col, link, title, job, idx, cap, text,
-                       warn=video.get("warn", ""))
-        log.info("%s OK - %d karakter (%.0f detik)", tag, len(text), time.time() - t0)
+        url, n = deliver_transcript(creds, sheet_id, tab_name, row, col, idx, total, name, text, cand, proj,
+                                    src_video=video["url"], src_note="caption YouTube (Apify)")
+        log.info("%s OK - %d karakter transkrip, file .md: %s (%.0f detik)", tag, len(text), url, time.time() - t0)
     except NoCaptions:
-        write_err("ERROR (tidak ada caption): video ini tidak punya caption/transkrip yang bisa "
+        write_err(f"ERROR (tidak ada caption) - {name}: video ini tidak punya caption/transkrip yang bisa "
                   "diambil (dinonaktifkan pemilik, private, atau dihapus).")
     except Exception as e:
-        write_err(f"ERROR (transkrip YouTube): {e}")
+        write_err(f"ERROR (transkrip YouTube) - {name}: {e}")
+
+
+# ------------------------------------------------- transkrip yang sudah ada di Drive
+
+_CUE_TS = re.compile(r"(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{1,3})\s*-->")
+
+
+def parse_subtitles(text):
+    """Isi .vtt / .srt -> [{'start': detik, 'text': ...}]."""
+    segs, start, lines = [], None, []
+    for raw in text.split("\n") + [""]:
+        line = raw.strip()
+        m = _CUE_TS.search(line)
+        if m:
+            if start is not None and lines:
+                segs.append({"start": start, "text": " ".join(lines)})
+            h, mi, sec, ms = m.groups()
+            start = int(h or 0) * 3600 + int(mi) * 60 + int(sec) + int(ms.ljust(3, "0")[:3]) / 1000
+            lines = []
+        elif not line:
+            if start is not None and lines:
+                segs.append({"start": start, "text": " ".join(lines)})
+            start, lines = None, []
+        elif start is not None:
+            lines.append(re.sub(r"<[^>]+>", "", line).strip())
+    return [sg for sg in segs if sg["text"].strip()]
+
+
+def read_drive_file_bytes(drive, file_id, max_bytes=8 * 1024 * 1024):
+    buf = io.BytesIO()
+    dl = MediaIoBaseDownload(buf, drive.files().get_media(fileId=file_id, supportsAllDrives=True),
+                             chunksize=4 * 1024 * 1024)
+    done = False
+    while not done:
+        _, done = dl.next_chunk(num_retries=3)
+        if buf.tell() > max_bytes:
+            raise RuntimeError("file transkrip terlalu besar")
+    return buf.getvalue()
+
+
+def read_sidecar_text(drive, sc):
+    """Isi file transkrip di Drive -> teks siap ditulis ke sel. Melempar error kalau tidak layak dipakai."""
+    kind = sc["kind"]
+    if kind == "gdoc":
+        data = drive.files().export(fileId=sc["id"], mimeType="text/plain").execute()
+        raw = data if isinstance(data, (bytes, bytearray)) else str(data).encode("utf-8")
+    else:
+        raw = read_drive_file_bytes(drive, sc["id"])
+    text = raw.decode("utf-8-sig", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    if kind in ("vtt", "srt"):
+        segs = parse_subtitles(text)
+        segs = [sg for i, sg in enumerate(segs) if i == 0 or sg["text"] != segs[i - 1]["text"]]
+        body = format_youtube_segments(segs, guess_units=False)
+    else:
+        body = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(re.sub(r"\s+", "", body)) < MIN_TRANSCRIPT_CHARS:
+        raise RuntimeError("isi file transkrip kosong/terlalu pendek")
+    return body
 
 
 def upload_via_disk(creds, drive, video, tag, state):
@@ -1044,21 +1136,39 @@ def upload_via_audio(creds, drive, video, tag, state):
             os.unlink(tmp_path)
 
 
-def process_one_video(creds, drive, video, idx, total, sheet_id, tab_name, row, col, job, cap):
+def process_one_video(creds, drive, video, idx, total, sheet_id, tab_name, row, col, cand="", proj=""):
     tag = f"[Video {idx}/{total}]"
     name = video["path"]
-    link, title = video["link"], video["title"]
+    src_video = f"https://drive.google.com/file/d/{video['id']}/view"
 
     def write_err(msg):
         log.error("%s %s", tag, msg)
         try:
-            put_error(creds, sheet_id, tab_name, row, col, link, title, msg)
+            update_slot(creds, sheet_id, tab_name, row, col, idx, total, msg)
         except Exception as e2:
             log.error("%s Gagal menulis pesan error ke sheet: %s", tag, e2)
 
+    sc = video.get("sidecar")
+    if sc:
+        body = None
+        try:
+            body = read_sidecar_text(drive, sc)
+        except Exception as e:
+            log.warning("%s Transkrip Drive '%s' tidak bisa dipakai (%s) - lanjut ke AssemblyAI", tag, sc["name"], e)
+        if body is not None:
+            try:
+                url, n = deliver_transcript(creds, sheet_id, tab_name, row, col, idx, total, name, body, cand, proj,
+                                            src_video=src_video,
+                                            src_note=f"file transkrip di Drive - {sc['name']}")
+                log.info("%s Transkrip sudah ada di Drive (%s: %s) - dipakai, AssemblyAI dilewati. File .md: %s",
+                         tag, sc["kind"], sc["name"], url)
+            except Exception as e:
+                write_err(f"ERROR (simpan file .md) - {name}: {e}")
+            return
+
     if video.get("can_download") is False:
         sa = getattr(creds, "service_account_email", "service account")
-        write_err("ERROR (tidak boleh di-download): pemilik/admin membatasi download untuk akun ini "
+        write_err(f"ERROR (tidak boleh di-download) - {name}: pemilik/admin membatasi download untuk akun ini "
                   f"(kemampuan 'canDownload' = false). Minta pemilik mengizinkan download, atau beri akses "
                   f"Editor ke {sa}. Video ini dilewati; video lain tetap diproses.")
         return
@@ -1072,9 +1182,8 @@ def process_one_video(creds, drive, video, idx, total, sheet_id, tab_name, row, 
         state["stage"] = "submit AssemblyAI"
         log.info("%s Tahap 3/3 Submit job (via webhook)...", tag)
         params = {"sheet_id": sheet_id, "tab_name": tab_name, "row": row, "col": col,
-                  "link": link, "label": title, "job": job, "idx": idx, "cap": cap}
-        if video.get("warn"):
-            params["warn"] = video["warn"]
+                  "idx": idx, "total": total, "label": name,
+                  "cand": cand, "proj": proj, "src": src_video}
         webhook_url = f"{BASE_URL}/webhook?{urlencode(params)}"
         submit_resp = requests.post(
             "https://api.assemblyai.com/v2/transcript",
@@ -1092,21 +1201,27 @@ def process_one_video(creds, drive, video, idx, total, sheet_id, tab_name, row, 
         submit_resp.raise_for_status()
         log.info("%s Tahap 3/3 OK - job id=%s, menunggu webhook", tag, submit_resp.json().get("id"))
     except Exception as e:
-        write_err(f"ERROR ({state['stage']}): {e}")
+        write_err(f"ERROR ({state['stage']}) - {name}: {e}")
+
+
+def finish_assemblyai(creds, transcript_id, sheet_id, tab_name, row, col, idx, total, title, cand, proj, src):
+    body = fetch_timestamped_transcript(transcript_id)
+    return deliver_transcript(creds, sheet_id, tab_name, row, col, idx, total, title, body, cand, proj,
+                              src_video=src,
+                              src_note=f"AssemblyAI (Universal-2, bahasa {TRANSCRIPT_LANGUAGE_CODE})")
 
 
 @app.get("/manual-recover")
 def manual_recover(transcript_id: str, sheet_id: str, row: int, tab_name: str = "Sheet1",
-                   col: str = "B", label: str = "", token: str = "",
-                   link: str = "", job: str = "", idx: int = 0, cap: int = MAX_CELL_CHARS):
+                   col: str = "G", label: str = "", token: str = "",
+                   idx: int = 1, total: int = 1, cand: str = "", proj: str = "", src: str = ""):
     """Endpoint darurat: tarik ulang transkrip yang sudah 'completed' di AssemblyAI
-    tapi webhook-nya gagal nyampe. Dipanggil manual lewat browser.
-    Isi `link` (link video Drive, persis seperti di header blok) supaya hasilnya masuk ke
-    BLOK video itu; `label` = judul video. Tanpa `link`, seluruh sel ditimpa (perilaku lama)."""
+    tapi webhook-nya gagal nyampe. Dipanggil manual lewat browser."""
     if not APP_SECRET_TOKEN or token != APP_SECRET_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     creds = get_credentials()
+    title = label or f"video {idx}"
     try:
         r = requests.get(
             f"https://api.assemblyai.com/v2/transcript/{transcript_id}",
@@ -1116,11 +1231,12 @@ def manual_recover(transcript_id: str, sheet_id: str, row: int, tab_name: str = 
         r.raise_for_status()
         status = r.json().get("status")
         if status != "completed":
-            put_error(creds, sheet_id, tab_name, row, col, link, label, f"ERROR (status AssemblyAI: {status})")
+            update_slot(creds, sheet_id, tab_name, row, col, idx, total,
+                        f"ERROR (status AssemblyAI: {status}) - {title}")
             return {"ok": False, "status": status}
-        text = fetch_timestamped_transcript(transcript_id)
-        put_transcript(creds, sheet_id, tab_name, row, col, link, label, job, idx, cap, text)
-        return {"ok": True, "chars": len(text)}
+        url, n = finish_assemblyai(creds, transcript_id, sheet_id, tab_name, row, col, idx, total,
+                                   title, cand, proj, src)
+        return {"ok": True, "chars": n, "url": url}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -1135,35 +1251,40 @@ async def webhook(request: Request):
     sheet_id = q.get("sheet_id")
     tab_name = q.get("tab_name", "Sheet1")
     row = int(q.get("row", 0))
-    col = q.get("col", "B")       # default "B" supaya job lama (tanpa col) tetap jalan
-    link = q.get("link", "")      # job lama (tanpa link) -> tulis seluruh sel seperti dulu
-    label = q.get("label", "")    # judul video
-    job = q.get("job", "")
-    idx = int(q.get("idx") or 0)
-    cap = int(q.get("cap") or MAX_CELL_CHARS)
-    warn = q.get("warn", "")
+    col = q.get("col", "G")
+    idx = int(q.get("idx", 1) or 1)
+    total = int(q.get("total", 1) or 1)
+    title = q.get("label", "") or f"video {idx}"
+    cand = q.get("cand", "")
+    proj = q.get("proj", "")
+    src = q.get("src", "")
 
     body = await request.json()
     transcript_id = body.get("transcript_id")
     status = body.get("status")
-    log.info("[WEBHOOK] row=%s kolom=%s transcript_id=%s status=%s", row, col, transcript_id, status)
+    log.info("[WEBHOOK] row=%s kolom=%s video=%s/%s transcript_id=%s status=%s",
+             row, col, idx, total, transcript_id, status)
 
-    creds = get_credentials()
-
-    if status != "completed":
-        detail = describe_failure(transcript_id, status)
-        put_error(creds, sheet_id, tab_name, row, col, link, label, f"ERROR (AssemblyAI {status}): {detail}")
-        return {"ok": True}
-
-    try:
-        text = fetch_timestamped_transcript(transcript_id)
-        put_transcript(creds, sheet_id, tab_name, row, col, link, label, job, idx, cap, text, warn=warn)
-        log.info("[WEBHOOK] SELESAI - hasil ditulis ke %s", a1(tab_name, col, row))
-    except Exception as e:
-        log.error("[WEBHOOK] Gagal ambil/tulis hasil: %s", e)
+    def work():
         try:
-            put_error(creds, sheet_id, tab_name, row, col, link, label, f"ERROR (ambil hasil transkrip): {e}")
-        except Exception as e2:
-            log.error("[WEBHOOK] Gagal menulis pesan error ke sheet: %s", e2)
+            creds = get_credentials()
+            if status != "completed":
+                detail = describe_failure(transcript_id, status)
+                update_slot(creds, sheet_id, tab_name, row, col, idx, total,
+                            f"ERROR (AssemblyAI {status}) - {title}: {detail}")
+                return
+            try:
+                url, n = finish_assemblyai(creds, transcript_id, sheet_id, tab_name, row, col, idx, total,
+                                           title, cand, proj, src)
+                log.info("[WEBHOOK] SELESAI - file .md: %s (baris %s, video %s/%s)", url, row, idx, total)
+            except Exception as e:
+                log.error("[WEBHOOK] Gagal ambil/simpan hasil: %s", e)
+                update_slot(creds, sheet_id, tab_name, row, col, idx, total,
+                            f"ERROR (ambil/simpan transkrip) - {title}: {e}")
+        except Exception as e:
+            log.error("[WEBHOOK] error tak terduga: %s", e)
 
+    # Dijalankan di thread terpisah supaya AssemblyAI langsung dapat balasan 200
+    # (menyimpan .md lewat Web App bisa makan beberapa detik; webhook yang lambat memicu pengiriman ulang).
+    threading.Thread(target=work, daemon=True, name=f"webhook-{row}-{idx}").start()
     return {"ok": True}
