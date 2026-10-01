@@ -685,8 +685,9 @@ def _finalize_job(job):
             job.result = {"ok": False, "error": msg}
             return
         res = save_markdown_to_drive(job.project, job.candidate, build_markdown(job))
-        write_link(creds, job.sheet_id, job.tab_name, job.row, job.col, res["url"])
         failed = job.total - len(good)
+        label = "Transcript" if not failed else f"Transcript ({len(good)}/{job.total} video, {failed} gagal - cek file)"
+        write_link(creds, job.sheet_id, job.tab_name, job.row, job.col, res["url"], label)
         log.info("[Job %s] SELESAI - %s (%s), %d/%d video berhasil -> %s",
                  job.id, f"transcript - {job.candidate}.md", res.get("action", "?"), len(good), job.total, res["url"])
         if failed:
