@@ -354,12 +354,18 @@ def save_markdown_to_drive(project, candidate, content):
                     "'Execute as: Me' dan 'Who has access: Anyone', serta URL berakhiran /exec")
             if not data.get("ok"):
                 raise RuntimeError("web app menolak: " + str(data.get("error", data))[:200])
+            if not data.get("url"):
+                raise RuntimeError(
+                    "web app membalas ok tapi tanpa 'url' file. Balasan aslinya: "
+                    + json.dumps(data, ensure_ascii=False)[:300]
+                    + ". Kemungkinan DRIVE_WEBAPP_URL menunjuk ke deployment/script lain, atau ada "
+                    "doPost/doGet ganda di project Apps Script.")
             return data
         except Exception as e:
             last = str(e).replace(DRIVE_WEBAPP_SECRET, "***")
             log.warning("[Drive] percobaan %d/3 gagal: %s", attempt, last)
-            if "menolak" in last and "Unauthorized" in last:
-                break          # secret salah: mengulang tidak membantu
+            if ("menolak" in last and "Unauthorized" in last) or "tanpa 'url'" in last:
+                break          # secret salah / balasan salah: mengulang tidak membantu
             time.sleep(4 * attempt)
     raise RuntimeError(last)
 
