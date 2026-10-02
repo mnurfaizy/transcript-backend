@@ -52,7 +52,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode, urlparse, parse_qs, urljoin
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Query
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 import requests
@@ -148,6 +148,7 @@ class TranscribeRequest(BaseModel):
     max_videos: int = HARD_CAP_VIDEOS   # batas video per baris (pengaman kredit)
     candidate: str = ""     # Nama kandidat (kolom A) -> nama file
     project: str = ""       # Project Assignment (kolom D) -> nama folder
+    force: bool = False     # True = proses ulang SEMUA video (abaikan hasil AssemblyAI sebelumnya)
 
 
 # ---------------------------------------------------------------- helper umum
@@ -268,6 +269,9 @@ class RowJob:
         self.col = col
         self.parts = {}          # idx (1-based) -> {"text", "error", "source"}
         self.tids = {}           # idx -> transcript_id AssemblyAI yang sudah di-submit (untuk pemulihan)
+        self.force = False       # True = jangan pakai ulang hasil lama
+        self.cancelled = False   # True = dibatalkan manual lewat /cancel
+        self.proc = None         # proses ffmpeg yang sedang berjalan (agar bisa dihentikan)
         self.finalized = False
         self.result = None       # {"ok": bool, "url"/"error": ...} setelah selesai
         self.created = time.time()
@@ -313,6 +317,11 @@ def submit_part(job, idx, text=None, error=None, source=""):
                 log.warning("[Job %s] gagal menulis progres: %s", job.id, e)
     if error and accepted:
         state_append(job.id, "err", {"idx": idx, "msg": error})
+    if text and accepted and source.startswith("AssemblyAI (Universal") and job.tids.get(idx) \
+            and idx - 1 < len(job.videos):
+        ck = cache_key(job.videos[idx - 1])
+        if ck:
+            cache_put(ck, job.tids[idx], job.videos[idx - 1].get("path", ""))
     if ready:
         finalize_job(job)
 
@@ -571,6 +580,7 @@ def restore_jobs():
         job = RowJob(jid, m["videos"], m.get("notes", ""), m["candidate"], m["project"],
                      m["sheet_id"], m["tab_name"], int(m["row"]), m["col"])
         job.created = float(m.get("created") or now)
+        job.force = bool(m.get("force"))
         for idx, msg in st["errs"].items():
             job.parts[idx] = {"text": None, "error": msg, "source": ""}
         for idx, tid in st["subs"].items():
@@ -653,8 +663,179 @@ def _on_startup():
         restore_jobs()
     except Exception as e:
         log.error("[State] pemulihan gagal: %s", e)
+    try:
+        cache_load()
+    except Exception as e:
+        log.warning("[Cache] gagal memuat catatan hasil video: %s", e)
     threading.Thread(target=_reconciler, daemon=True, name="reconciler").start()
     threading.Thread(target=_keepalive, daemon=True, name="keepalive").start()
+
+
+# ---------------------------------------------------------------- pakai ulang hasil lama
+# Setiap video Drive yang BERHASIL ditranskrip AssemblyAI dicatat (ID file + ukuran -> transcript_id)
+# di tab tersembunyi "_tx_cache". Saat baris dijalankan ulang, video yang sama langsung diambil
+# hasilnya dari AssemblyAI (tanpa upload & kredit baru). Mode "paksa" (force) mengabaikan catatan ini.
+CACHE_TAB = "_tx_cache"
+VIDEO_CACHE = {}
+VIDEO_CACHE_LOCK = threading.Lock()
+
+
+def cache_key(video):
+    if not video or video.get("kind") == "youtube" or not video.get("id"):
+        return None
+    return f"{video['id']}:{video.get('size') or 0}"
+
+
+def _ensure_hidden_tab(name, header):
+    sh = _sheets_svc()
+    meta = sh.spreadsheets().get(spreadsheetId=STATE_SHEET_ID, fields="sheets.properties(sheetId,title)").execute()
+    if any(x["properties"]["title"] == name for x in meta.get("sheets", [])):
+        return
+    sh.spreadsheets().batchUpdate(spreadsheetId=STATE_SHEET_ID, body={"requests": [{
+        "addSheet": {"properties": {"title": name, "hidden": True,
+                                    "gridProperties": {"rowCount": 1000, "columnCount": len(header)}}}}]}).execute()
+    sh.spreadsheets().values().update(
+        spreadsheetId=STATE_SHEET_ID, range=f"'{name}'!A1", valueInputOption="RAW",
+        body={"values": [header]}).execute()
+    log.info("[Cache] tab tersembunyi '%s' dibuat", name)
+
+
+def cache_load():
+    if not STATE_SHEET_ID:
+        return
+    _ensure_hidden_tab(CACHE_TAB, ["key", "waktu", "transcript_id", "video"])
+    res = _sheets_svc().spreadsheets().values().get(
+        spreadsheetId=STATE_SHEET_ID, range=f"'{CACHE_TAB}'!A2:D").execute()
+    with VIDEO_CACHE_LOCK:
+        for r in res.get("values", []):
+            if len(r) >= 3 and r[0] and r[2]:
+                VIDEO_CACHE[r[0]] = r[2]
+    log.info("[Cache] %d hasil video tercatat untuk dipakai ulang", len(VIDEO_CACHE))
+
+
+def cache_put(key, tid, label=""):
+    with VIDEO_CACHE_LOCK:
+        if VIDEO_CACHE.get(key) == tid:
+            return
+        VIDEO_CACHE[key] = tid
+    if not STATE_SHEET_ID:
+        return
+    try:
+        with STATE_LOCK:
+            _ensure_hidden_tab(CACHE_TAB, ["key", "waktu", "transcript_id", "video"])
+            _sheets_svc().spreadsheets().values().append(
+                spreadsheetId=STATE_SHEET_ID, range=f"'{CACHE_TAB}'!A:D", valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [[key, datetime.now(timezone.utc).isoformat(timespec="seconds"), tid, label[:200]]]},
+            ).execute()
+    except Exception as e:
+        log.warning("[Cache] gagal mencatat hasil video: %s", e)
+
+
+# ---------------------------------------------------------------- pembatalan manual
+CANCEL_MSG = "DIBATALKAN: proses dihentikan manual. Kosongkan sel ini lalu jalankan ulang bila perlu."
+CANCEL_KEYS = {}          # (sheet_id, tab, row) -> waktu permintaan batal
+CANCEL_ALL_AT = [0.0]     # waktu terakhir "batalkan semua"
+
+
+def is_cancel_requested(sheet_id, tab_name, row, since):
+    """True kalau ada permintaan batal untuk baris ini SETELAH proses baris dimulai (`since`)."""
+    return CANCEL_ALL_AT[0] > since or CANCEL_KEYS.get((sheet_id, tab_name, int(row)), 0) > since
+
+
+def _cancel_one(job, why):
+    with job.lock:
+        if job.finalized:
+            return False
+        job.finalized = True
+        job.cancelled = True
+    with ROW_JOBS_LOCK:
+        ROW_JOBS.pop(job.id, None)
+    FINISHED_JOBS[job.id] = time.time()
+    state_append(job.id, "done", {})
+    p = job.proc
+    if p is not None and p.poll() is None:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    log.warning("[Batal] job %s (baris %s, %s) dihentikan: %s", job.id, job.row, job.candidate, why)
+    try:
+        write_cell(get_credentials(), job.sheet_id, job.tab_name, job.row, job.col, CANCEL_MSG)
+    except Exception as e:
+        log.warning("[Batal] gagal menulis pesan ke sel: %s", e)
+    return True
+
+
+def cancel_jobs(sheet_id="", tab_name="", row=0, cancel_all=False):
+    """Hentikan job yang sedang jalan + hapus yang masih antre. Video yang SUDAH terkirim ke AssemblyAI
+    tetap diproses di sana (kredit terpakai), tapi hasilnya diabaikan."""
+    now = time.time()
+    if cancel_all:
+        CANCEL_ALL_AT[0] = now
+    elif row:
+        CANCEL_KEYS[(sheet_id, tab_name, int(row))] = now
+
+    def match(sid, tab, r):
+        if cancel_all:
+            return True
+        return bool(row) and int(r) == int(row) and (not sheet_id or sid == sheet_id) and (not tab_name or tab == tab_name)
+
+    # 1. antrean (belum mulai)
+    removed = []
+    with JOBS.mutex:
+        for item in list(JOBS.queue):
+            if item and item[0] == "__resume__":
+                j = ROW_JOBS.get(item[1])
+                hit = bool(j) and match(j.sheet_id, j.tab_name, j.row)
+            else:
+                hit = match(item[2], item[3], item[4])
+            if hit:
+                JOBS.queue.remove(item)
+                JOBS.unfinished_tasks = max(0, JOBS.unfinished_tasks - 1)
+                removed.append(item)
+        if JOBS.unfinished_tasks == 0:
+            JOBS.all_tasks_done.notify_all()
+    for item in removed:
+        if item[0] != "__resume__":
+            try:
+                write_cell(get_credentials(), item[2], item[3], item[4], item[5], CANCEL_MSG)
+            except Exception as e:
+                log.warning("[Batal] gagal menulis pesan ke sel: %s", e)
+    # 2. job yang sedang berjalan / menunggu webhook
+    with ROW_JOBS_LOCK:
+        jobs = [j for j in ROW_JOBS.values() if match(j.sheet_id, j.tab_name, j.row)]
+    stopped = sum(1 for j in jobs if _cancel_one(j, "dibatalkan lewat /cancel"))
+    # 3. catatan di tab state yang belum 'done' (mis. job yang belum sempat dipulihkan)
+    marked = 0
+    if STATE_SHEET_ID:
+        try:
+            for jid, st in state_load().items():
+                m = st.get("meta")
+                if st["done"] or not m or jid in FINISHED_JOBS:
+                    continue
+                if match(m.get("sheet_id"), m.get("tab_name"), m.get("row", 0)):
+                    FINISHED_JOBS[jid] = time.time()
+                    state_append(jid, "done", {})
+                    marked += 1
+        except Exception as e:
+            log.warning("[Batal] gagal memeriksa tab state: %s", e)
+    log.warning("[Batal] selesai: %d job dihentikan, %d dihapus dari antrean, %d catatan state ditutup",
+                stopped, len(removed), marked)
+    return {"ok": True, "dihentikan": stopped, "dihapus_dari_antrean": len(removed), "catatan_state_ditutup": marked}
+
+
+@app.api_route("/cancel", methods=["GET", "POST"])
+def cancel(request: Request, sheet_id: str = "", tab_name: str = "", row: int = 0,
+           all_jobs: bool = Query(False, alias="all"), token: str = ""):
+    """Hentikan proses. Auth: header 'Authorization: Bearer <APP_SECRET_TOKEN>' atau ?token=.
+    Contoh darurat di browser:  /cancel?all=true&token=<APP_SECRET_TOKEN>"""
+    auth = request.headers.get("authorization", "")
+    if not APP_SECRET_TOKEN or (auth != f"Bearer {APP_SECRET_TOKEN}" and token != APP_SECRET_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not all_jobs and not row:
+        raise HTTPException(status_code=400, detail="isi row (+ sheet_id/tab_name) atau all=true")
+    return cancel_jobs(sheet_id, tab_name, row, all_jobs)
 
 
 FINISHED_OK = {}     # job_id -> waktu; job yang sudah sukses TIDAK boleh ditimpa pesan error
@@ -963,7 +1144,7 @@ def health():
             "drive_webapp": bool(DRIVE_WEBAPP_URL and DRIVE_WEBAPP_SECRET),
             "state_store": bool(STATE_SHEET_ID),
             "uptime_s": int(time.time() - STARTED_AT), "memori": mem_text(),
-            "job_aktif": len(ROW_JOBS), "antrean": JOBS.qsize()}
+            "job_aktif": len(ROW_JOBS), "antrean": JOBS.qsize(), "hasil_tersimpan": len(VIDEO_CACHE)}
 
 
 @app.post("/transcribe")
@@ -985,15 +1166,16 @@ def transcribe(req: TranscribeRequest, request: Request):
              "kandidat=%s, project=%s", len(root_ids), len(youtube_urls), req.tab_name, req.row,
              output_col, max_videos, candidate, project)
     JOBS.put((root_ids, youtube_urls, req.sheet_id, req.tab_name, req.row, output_col, max_videos,
-              candidate, project))
+              candidate, project, bool(req.force)))
     waiting = JOBS.qsize()
     log.info("[Antrean] baris %s masuk antrean (menunggu giliran: %d)", req.row, waiting)
     return {"status": "diterima, masuk antrean", "menunggu_di_depan": waiting}
 
 
 def process_request(root_ids, youtube_urls, sheet_id, tab_name, row, output_col, max_videos,
-                    candidate, project):
+                    candidate, project, force=False):
     job = None
+    started = time.time()
     try:
         creds = get_credentials()
         sa_email = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON).get("client_email", "service account")
@@ -1024,6 +1206,11 @@ def process_request(root_ids, youtube_urls, sheet_id, tab_name, row, output_col,
         total = len(videos)
         log.info("[Resolve] Ditemukan %d video.%s", total, summarize_skipped(skipped))
 
+        if is_cancel_requested(sheet_id, tab_name, row, started):
+            log.warning("[Batal] baris %s dibatalkan sebelum video mulai diproses", row)
+            write_cell(creds, sheet_id, tab_name, row, output_col, CANCEL_MSG)
+            return
+
         if total == 0:
             detail = (" " + "; ".join(notes).rstrip(".") + ".") if notes else ""
             hint = f" Untuk link Drive, pastikan sudah di-share ke {sa_email} (minimal Viewer)." if root_ids else ""
@@ -1041,11 +1228,12 @@ def process_request(root_ids, youtube_urls, sheet_id, tab_name, row, output_col,
             note_parts.append(summarize_skipped(skipped).strip())
         job = RowJob(uuid.uuid4().hex[:12], videos, "; ".join(n for n in note_parts if n),
                      candidate, project, sheet_id, tab_name, row, output_col)
+        job.force = bool(force)
         register_job(job)
         state_append(job.id, "job", {
             "videos": videos, "notes": job.notes, "candidate": candidate, "project": project,
             "sheet_id": sheet_id, "tab_name": tab_name, "row": row, "col": output_col,
-            "created": job.created})
+            "created": job.created, "force": job.force})
         write_cell(creds, sheet_id, tab_name, row, output_col, f"Diproses: {total} video - dalam antrean")
         log.info("[Job %s] mulai - memori terpakai %s", job.id, mem_text())
 
@@ -1420,6 +1608,8 @@ def upload_via_disk(creds, drive, video, tag, state):
         downloader = MediaIoBaseDownload(fh, request_media, chunksize=10 * 1024 * 1024)
         done, last_pct = False, -1
         while not done:
+            if state.get("job") is not None and state["job"].cancelled:
+                raise RuntimeError("dibatalkan manual")
             status, done = downloader.next_chunk()
             if status:
                 pct = int(status.progress() * 100)
@@ -1496,7 +1686,7 @@ def explain_drive_error(status, reason, message, sa_email):
     return base
 
 
-def extract_audio_via_ffmpeg(creds, file_id, out_path, tag=""):
+def extract_audio_via_ffmpeg(creds, file_id, out_path, tag="", job=None):
     """ffmpeg membaca video langsung dari Drive lewat HTTP (mendukung Range, jadi MP4
     yang metadata-nya di akhir file pun aman), membuang video, menyimpan audionya.
     Progres ditulis ke log tiap PROGRESS_LOG_EVERY_S detik."""
@@ -1515,6 +1705,10 @@ def extract_audio_via_ffmpeg(creds, file_id, out_path, tag=""):
         "-y", out_path,
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    if job is not None:
+        job.proc = proc
+        if job.cancelled:      # dibatalkan tepat saat ffmpeg baru mulai
+            proc.kill()
     timed_out = {"v": False}
 
     def _kill():
@@ -1548,6 +1742,10 @@ def extract_audio_via_ffmpeg(creds, file_id, out_path, tag=""):
         timer.cancel()
         if proc.poll() is None:
             proc.kill()
+        if job is not None:
+            job.proc = None
+    if job is not None and job.cancelled:
+        raise RuntimeError("dibatalkan manual")
     if timed_out["v"]:
         raise RuntimeError(f"ffmpeg melebihi batas waktu {FFMPEG_TIMEOUT_S} detik")
     if rc != 0:
@@ -1574,7 +1772,7 @@ def upload_via_audio(creds, drive, video, tag, state):
         tmp.close()
 
         t0 = time.time()
-        extract_audio_via_ffmpeg(creds, video["id"], tmp_path, tag)
+        extract_audio_via_ffmpeg(creds, video["id"], tmp_path, tag, state.get("job"))
         out_mb = os.path.getsize(tmp_path) / 1024 / 1024
         if out_mb <= 0:
             raise RuntimeError("hasil ekstraksi audio kosong")
@@ -1617,6 +1815,20 @@ def process_one_video(creds, drive, video, idx, total, job):
             submit_part(job, idx, text=body, source=f"file transkrip di Drive - {sc['name']}")
             return
 
+    # Pakai ulang hasil AssemblyAI dari proses sebelumnya (video yang sama: ID file + ukuran sama).
+    if not job.force:
+        ck = cache_key(video)
+        old_tid = VIDEO_CACHE.get(ck) if ck else None
+        if old_tid:
+            try:
+                old_text = fetch_timestamped_transcript(old_tid)
+            except Exception as e:
+                log.warning("%s hasil lama (%s) tidak bisa diambil (%s) - diproses ulang", tag, old_tid, e)
+            else:
+                log.info("%s Hasil AssemblyAI sebelumnya dipakai ulang (transcript_id=%s) - tanpa upload/kredit baru", tag, old_tid)
+                submit_part(job, idx, text=old_text, source="AssemblyAI (hasil sebelumnya, dipakai ulang)")
+                return
+
     if video.get("can_download") is False:
         sa = getattr(creds, "service_account_email", "service account")
         fail_part(f"ERROR (tidak boleh di-download) - {name}: pemilik/admin membatasi download untuk akun ini "
@@ -1626,10 +1838,13 @@ def process_one_video(creds, drive, video, idx, total, job):
 
     size = video.get("size")
     use_audio = bool(size and size > DISK_MAX_BYTES)
-    state = {"stage": "download Drive"}
+    state = {"stage": "download Drive", "job": job}
     try:
         upload_url = (upload_via_audio if use_audio else upload_via_disk)(creds, drive, video, tag, state)
 
+        if job.finalized:      # dibatalkan selama upload: jangan submit (hemat kredit transkripsi)
+            log.warning("%s job sudah dihentikan - tidak di-submit ke AssemblyAI", tag)
+            return
         state["stage"] = "submit AssemblyAI"
         log.info("%s Tahap 3/3 Submit job (via webhook)...", tag)
         # job/idx/total: untuk menggabungkan semua video satu baris ke satu file .md.
@@ -1657,6 +1872,9 @@ def process_one_video(creds, drive, video, idx, total, job):
         state_append(job.id, "sub", {"idx": idx, "tid": tid})
         log.info("%s Tahap 3/3 OK - job id=%s, menunggu webhook", tag, tid)
     except Exception as e:
+        if job.cancelled:
+            log.warning("%s dihentikan karena job dibatalkan manual", tag)
+            return
         fail_part(f"ERROR ({state['stage']}) - {name}: {e}")
 
 
