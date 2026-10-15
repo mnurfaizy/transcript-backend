@@ -129,6 +129,13 @@ HARD_CAP_VIDEOS = 20
 # "id" = Indonesia. Ganti kalau bahasa dominan video berbeda.
 TRANSCRIPT_LANGUAGE_CODE = "id"
 
+# Pembeda pembicara (speaker diarization) AssemblyAI: transkrip ditandai "Pembicara A", "Pembicara B", dst.
+# Tambahan biaya kecil per jam audio (dipotong dari kredit). Matikan dengan SPEAKER_LABELS=0.
+# SPEAKERS_EXPECTED (opsional): jumlah pembicara kalau sudah pasti, mis. 2 (pewawancara + kandidat).
+SPEAKER_LABELS = os.environ.get("SPEAKER_LABELS", "1") != "0"
+SPEAKERS_EXPECTED = int(os.environ.get("SPEAKERS_EXPECTED", "0") or 0)
+SPEAKER_CHUNK_MS = 45_000   # ucapan panjang satu pembicara dipecah per ~45 detik (timestamp baru)
+
 FOLDER_MIME = "application/vnd.google-apps.folder"
 VIDEO_EXTENSIONS = {
     ".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi", ".wmv", ".flv",
@@ -246,11 +253,50 @@ def format_timestamp_ms(ms):
     return f"{minutes:02d}:{seconds:02d}"
 
 
+def _split_utterance(u):
+    """Pecah ucapan panjang (monolog) jadi beberapa potong ~SPEAKER_CHUNK_MS, di akhir kalimat
+    kalau bisa, supaya timestamp tetap rapat. Hasil: [(start_ms, text), ...]."""
+    words = u.get("words") or []
+    if not words or (u.get("end", 0) - u.get("start", 0)) <= SPEAKER_CHUNK_MS * 1.5:
+        return [(u.get("start", 0), (u.get("text") or "").strip())]
+    chunks, cur, cur_start = [], [], None
+    for w in words:
+        if cur_start is None:
+            cur_start = w.get("start", 0)
+        text = w.get("text", "")
+        cur.append(text)
+        dur = w.get("end", 0) - cur_start
+        if (dur >= SPEAKER_CHUNK_MS and re.search(r"[.!?]$", text)) or dur >= SPEAKER_CHUNK_MS * 2:
+            chunks.append((cur_start, " ".join(cur)))
+            cur, cur_start = [], None
+    if cur:
+        chunks.append((cur_start, " ".join(cur)))
+    return chunks
+
+
+def format_utterances(utterances):
+    """Transkrip per pembicara: '[MM:SS] **Pembicara A:** ...'."""
+    lines = []
+    for u in utterances:
+        who = f"Pembicara {u.get('speaker') or '?'}"
+        for start, text in _split_utterance(u):
+            if text:
+                lines.append(f"[{format_timestamp_ms(start)}] **{who}:** {text}")
+    return "\n\n".join(lines)
+
+
 def fetch_timestamped_transcript(transcript_id):
-    """Transkrip per paragraf, tiap paragraf diawali timestamp [MM:SS]."""
+    """Transkrip ber-timestamp. Kalau ada label pembicara: per ucapan '[MM:SS] **Pembicara A:** ...';
+    kalau tidak (transkrip lama / diarization mati): per paragraf '[MM:SS] ...'."""
+    headers = {"authorization": ASSEMBLYAI_API_KEY}
+    resp = requests.get(f"https://api.assemblyai.com/v2/transcript/{transcript_id}", headers=headers, timeout=120)
+    resp.raise_for_status()
+    utterances = resp.json().get("utterances") or []
+    if utterances:
+        return format_utterances(utterances)
     resp = requests.get(
         f"https://api.assemblyai.com/v2/transcript/{transcript_id}/paragraphs",
-        headers={"authorization": ASSEMBLYAI_API_KEY},
+        headers=headers,
         timeout=60,
     )
     resp.raise_for_status()
@@ -2018,19 +2064,29 @@ def process_one_video(creds, drive, video, idx, total, job):
                   "tab_name": job.tab_name, "row": job.row, "col": job.col,
                   "candidate": job.candidate, "project": job.project, "label": name}
         webhook_url = f"{BASE_URL}/webhook?{urlencode(params)}"
-        submit_resp = requests.post(
-            "https://api.assemblyai.com/v2/transcript",
-            headers={"authorization": ASSEMBLYAI_API_KEY},
-            json={
-                "audio_url": upload_url,
-                "language_code": TRANSCRIPT_LANGUAGE_CODE,
-                "speech_models": ["universal-2"],
-                "webhook_url": webhook_url,
-                "webhook_auth_header_name": "x-webhook-secret",
-                "webhook_auth_header_value": WEBHOOK_SECRET,
-            },
-            timeout=60,
-        )
+        body = {
+            "audio_url": upload_url,
+            "language_code": TRANSCRIPT_LANGUAGE_CODE,
+            "speech_models": ["universal-2"],
+            "webhook_url": webhook_url,
+            "webhook_auth_header_name": "x-webhook-secret",
+            "webhook_auth_header_value": WEBHOOK_SECRET,
+        }
+        if SPEAKER_LABELS:
+            body["speaker_labels"] = True
+            if SPEAKERS_EXPECTED > 0:
+                body["speakers_expected"] = SPEAKERS_EXPECTED
+        submit_resp = requests.post("https://api.assemblyai.com/v2/transcript",
+                                    headers={"authorization": ASSEMBLYAI_API_KEY}, json=body, timeout=60)
+        if submit_resp.status_code == 400 and SPEAKER_LABELS:
+            # mis. label pembicara tidak didukung untuk bahasa/model ini: kirim ulang tanpa label
+            # (audio yang sudah di-upload dipakai lagi, tidak di-upload ulang).
+            log.warning("%s AssemblyAI menolak label pembicara (%s) - dikirim ulang tanpa label",
+                        tag, submit_resp.text[:200])
+            body.pop("speaker_labels", None)
+            body.pop("speakers_expected", None)
+            submit_resp = requests.post("https://api.assemblyai.com/v2/transcript",
+                                        headers={"authorization": ASSEMBLYAI_API_KEY}, json=body, timeout=60)
         submit_resp.raise_for_status()
         tid = submit_resp.json().get("id")
         job.tids[idx] = tid
