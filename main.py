@@ -25,7 +25,7 @@ Alur:
     -> langsung balas "diterima", lalu di background:
        Resolve : cek file/folder, kumpulkan daftar video
        Per video (satu per satu): ambil video/audio -> upload AssemblyAI -> submit job + webhook
-       (video kecil di-download utuh; video besar cukup diekstrak audionya lewat ffmpeg)
+       (yang di-upload SELALU audionya saja hasil ffmpeg, bukan videonya: hemat bandwidth)
   POST /webhook (dipanggil AssemblyAI per video yang selesai)
     -> ambil transkrip ber-timestamp, simpan sebagai bagian dari "job baris"
   Begitu SEMUA video sebuah baris punya hasil (berhasil atau gagal):
@@ -86,16 +86,18 @@ JOB_TTL_S = 12 * 3600       # job baris yang tak kunjung lengkap dibuang dari me
 # Opsional (Environment Variable Render): seberapa dalam subfolder ditelusuri.
 MAX_FOLDER_DEPTH = int(os.environ.get("MAX_FOLDER_DEPTH", "5"))
 
-# Penyimpanan sementara (/tmp) instance Render free dibatasi 2 GB. Kalau penuh,
-# Render mematikan instance dan SEMUA job yang sedang jalan hilang. Jadi:
-#   ukuran <= DISK_MAX_MB : download video ke disk lalu upload (jalur teruji)
-#   ukuran  > DISK_MAX_MB : videonya TIDAK disimpan. ffmpeg membaca langsung dari
-#                           Drive lewat HTTP, membuang gambarnya, dan hanya menyimpan
-#                           audio (mono 16 kHz mp3, sekitar 28 MB per jam). Audio kecil
-#                           itulah yang di-upload ke AssemblyAI. Tidak ada batas ukuran video.
+# Bandwidth KELUAR (upload ke AssemblyAI) dihitung kuota Render, download dari Drive tidak.
+# Karena itu yang di-upload SELALU audionya saja (mono 16 kHz mp3, sekitar 28 MB per jam pada
+# 64k), tidak pernah videonya (bisa ratusan MB):
+#   1. ffmpeg membaca video langsung dari Drive lewat HTTP, membuang gambarnya, menyimpan audio.
+#   2. Kalau langkah 1 gagal dan ukuran <= DISK_MAX_MB: video di-download ke /tmp, audionya
+#      diekstrak dari file lokal itu, lalu videonya langsung dihapus. (/tmp instance Render free
+#      dibatasi 2 GB; kalau penuh, instance mati dan SEMUA job yang sedang jalan hilang.)
+# Upload video mentah hanya kalau ALLOW_RAW_VIDEO_UPLOAD=1 dan ffmpeg tidak terpasang.
 DISK_MAX_MB = int(os.environ.get("DISK_MAX_MB", "1500"))
 DISK_MAX_BYTES = DISK_MAX_MB * 1024 * 1024
-AUDIO_BITRATE = "64k"
+AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "64k")
+ALLOW_RAW_VIDEO_UPLOAD = os.environ.get("ALLOW_RAW_VIDEO_UPLOAD", "0") == "1"
 FFMPEG_TIMEOUT_S = int(os.environ.get("FFMPEG_TIMEOUT_S", "3600"))
 PROGRESS_LOG_EVERY_S = 30   # seberapa sering progres ekstraksi audio ditulis ke log
 
@@ -272,6 +274,7 @@ class RowJob:
         self.force = False       # True = jangan pakai ulang hasil lama
         self.cancelled = False   # True = dibatalkan manual lewat /cancel
         self.proc = None         # proses ffmpeg yang sedang berjalan (agar bisa dihentikan)
+        self.upload_bytes = 0    # total byte yang di-upload ke AssemblyAI untuk baris ini
         self.finalized = False
         self.result = None       # {"ok": bool, "url"/"error": ...} setelah selesai
         self.created = time.time()
@@ -854,6 +857,8 @@ def _finalize_job(job):
     """Semua video baris ini sudah punya hasil: simpan .md, tulis link (atau error) ke kolom hasil."""
     with ROW_JOBS_LOCK:
         ROW_JOBS.pop(job.id, None)
+    log.info("[Bandwidth] job %s (baris %s): total upload ke AssemblyAI %.1f MB untuk %d video",
+             job.id, job.row, job.upload_bytes / 1024 / 1024, job.total)
     try:
         creds = get_credentials()
         good = [i for i, p in job.parts.items() if p.get("text")]
@@ -1138,13 +1143,15 @@ threading.Thread(target=_worker, daemon=True, name="job-worker").start()
 
 @app.get("/")
 def health():
-    # "ffmpeg": true = ffmpeg terpasang (dibutuhkan untuk video besar)
+    # "ffmpeg": true = ffmpeg terpasang (WAJIB: tanpa ffmpeg video Drive tidak diproses)
+    # "upload_mb": total MB yang di-upload ke AssemblyAI per tanggal (WITA) sejak backend start
     # "drive_webapp": true = DRIVE_WEBAPP_URL & DRIVE_WEBAPP_SECRET sudah di-set (untuk menyimpan file .md)
     return {"status": "ok", "ffmpeg": shutil.which("ffmpeg") is not None,
             "drive_webapp": bool(DRIVE_WEBAPP_URL and DRIVE_WEBAPP_SECRET),
             "state_store": bool(STATE_SHEET_ID),
             "uptime_s": int(time.time() - STARTED_AT), "memori": mem_text(),
-            "job_aktif": len(ROW_JOBS), "antrean": JOBS.qsize(), "hasil_tersimpan": len(VIDEO_CACHE)}
+            "job_aktif": len(ROW_JOBS), "antrean": JOBS.qsize(), "hasil_tersimpan": len(VIDEO_CACHE),
+            "upload_mb": {d: round(b / 1024 / 1024, 1) for d, b in sorted(UPLOAD_BYTES_BY_DAY.items())}}
 
 
 @app.post("/transcribe")
@@ -1591,19 +1598,50 @@ def read_sidecar_text(drive, sc):
     return body
 
 
-def upload_via_disk(creds, drive, video, tag, state):
-    """Jalur teruji: download ke /tmp, upload, lalu file langsung dihapus."""
-    tmp_path = None
-    try:
-        state["stage"] = "download Drive"
-        log.info("%s Tahap 1/3 Download: %s", tag, video["path"])
-        request_media = drive.files().get_media(fileId=video["id"], supportsAllDrives=True)
-        tmp = tempfile.NamedTemporaryFile(
-            delete=False, suffix=os.path.splitext(video["name"])[1] or ".bin"
-        )
-        tmp_path = tmp.name
-        tmp.close()
+# Total byte yang di-upload ke AssemblyAI per tanggal (WITA), untuk dicocokkan dengan grafik
+# "Outbound Bandwidth" Render. Hanya di memori (hilang kalau restart); angka per video ada di log.
+UPLOAD_BYTES_BY_DAY = {}
+UPLOAD_BYTES_LOCK = threading.Lock()
 
+
+def upload_file_to_assemblyai(path, tag, state, what="audio"):
+    """Upload satu file ke AssemblyAI (tanpa retry: upload ulang = bandwidth dobel), catat ukurannya."""
+    nbytes = os.path.getsize(path)
+    state["stage"] = "upload AssemblyAI"
+    log.info("%s Tahap 2/3 Upload %s ke AssemblyAI (%.1f MB)...", tag, what, nbytes / 1024 / 1024)
+    with open(path, "rb") as f:
+        resp = requests.post(
+            ASSEMBLYAI_UPLOAD_URL,
+            headers={"authorization": ASSEMBLYAI_API_KEY},
+            data=f,
+            timeout=(15, 1800),
+        )
+    day = datetime.now(WITA).strftime("%Y-%m-%d")
+    with UPLOAD_BYTES_LOCK:
+        UPLOAD_BYTES_BY_DAY[day] = UPLOAD_BYTES_BY_DAY.get(day, 0) + nbytes
+        today = UPLOAD_BYTES_BY_DAY[day]
+    job = state.get("job")
+    if job is not None:
+        job.upload_bytes += nbytes
+    log.info("[Bandwidth] %s upload %s %.1f MB (job %s: %.1f MB, hari ini %s: %.1f MB)", tag, what,
+             nbytes / 1024 / 1024, job.id if job else "-", (job.upload_bytes if job else 0) / 1024 / 1024,
+             day, today / 1024 / 1024)
+    resp.raise_for_status()
+    log.info("%s Tahap 2/3 OK", tag)
+    return resp.json()["upload_url"]
+
+
+def download_to_disk(drive, video, tag, state):
+    """Download video Drive ke /tmp. Hasil: path file (pemanggil wajib menghapusnya)."""
+    state["stage"] = "download Drive"
+    log.info("%s Download ke disk: %s", tag, video["path"])
+    request_media = drive.files().get_media(fileId=video["id"], supportsAllDrives=True)
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=os.path.splitext(video["name"])[1] or ".bin"
+    )
+    tmp_path = tmp.name
+    tmp.close()
+    try:
         fh = io.FileIO(tmp_path, "wb")
         downloader = MediaIoBaseDownload(fh, request_media, chunksize=10 * 1024 * 1024)
         done, last_pct = False, -1
@@ -1617,23 +1655,20 @@ def upload_via_disk(creds, drive, video, tag, state):
                     log.info("%s   progress download: %d%%", tag, pct)
                     last_pct = pct
         fh.close()
-        log.info("%s Tahap 1/3 OK - %.1f MB", tag, os.path.getsize(tmp_path) / 1024 / 1024)
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
+    log.info("%s Download OK - %.1f MB", tag, os.path.getsize(tmp_path) / 1024 / 1024)
+    return tmp_path
 
-        state["stage"] = "upload AssemblyAI"
-        log.info("%s Tahap 2/3 Upload ke AssemblyAI...", tag)
-        with open(tmp_path, "rb") as f:
-            resp = requests.post(
-                ASSEMBLYAI_UPLOAD_URL,
-                headers={"authorization": ASSEMBLYAI_API_KEY},
-                data=f,
-                timeout=(15, 1800),
-            )
-        resp.raise_for_status()
-        log.info("%s Tahap 2/3 OK", tag)
-        return resp.json()["upload_url"]
+
+def upload_raw_video(creds, drive, video, tag, state):
+    """Cadangan darurat (ALLOW_RAW_VIDEO_UPLOAD=1 dan ffmpeg tidak ada): upload videonya utuh."""
+    tmp_path = download_to_disk(drive, video, tag, state)
+    try:
+        return upload_file_to_assemblyai(tmp_path, tag, state, what="VIDEO UTUH")
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        os.unlink(tmp_path)
 
 
 def format_hms(seconds):
@@ -1686,21 +1721,29 @@ def explain_drive_error(status, reason, message, sa_email):
     return base
 
 
-def extract_audio_via_ffmpeg(creds, file_id, out_path, tag="", job=None):
+def extract_audio_via_ffmpeg(creds, file_id, out_path, tag="", job=None, local_input=None):
     """ffmpeg membaca video langsung dari Drive lewat HTTP (mendukung Range, jadi MP4
     yang metadata-nya di akhir file pun aman), membuang video, menyimpan audionya.
+    local_input: path video yang sudah di-download (dipakai sebagai ganti Drive HTTP).
     Progres ditulis ke log tiap PROGRESS_LOG_EVERY_S detik."""
-    creds.refresh(GoogleAuthRequest())
-    token = creds.token
-    duration = probe_duration(token, file_id)
+    if local_input:
+        token, duration = None, None
+        source = ["-i", local_input]
+    else:
+        creds.refresh(GoogleAuthRequest())
+        token = creds.token
+        duration = probe_duration(token, file_id)
+        source = [
+            "-headers", f"Authorization: Bearer {token}\r\n",
+            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
+            "-i", DRIVE_MEDIA_URL.format(file_id=file_id),
+        ]
     if duration:
         log.info("%s   durasi video: %s", tag, format_hms(duration))
     cmd = [
         "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-nostats", "-threads", "1",
         "-progress", "pipe:1",
-        "-headers", f"Authorization: Bearer {token}\r\n",
-        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
-        "-i", DRIVE_MEDIA_URL.format(file_id=file_id),
+        *source,
         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
         "-y", out_path,
     ]
@@ -1749,10 +1792,13 @@ def extract_audio_via_ffmpeg(creds, file_id, out_path, tag="", job=None):
     if timed_out["v"]:
         raise RuntimeError(f"ffmpeg melebihi batas waktu {FFMPEG_TIMEOUT_S} detik")
     if rc != 0:
-        err = "\n".join(err_lines[-6:]).replace(token, "***").strip()
+        err = "\n".join(err_lines[-6:])
+        if token:
+            err = err.replace(token, "***")
+        err = err.strip()
         if "does not contain any stream" in err:
             raise RuntimeError("video ini tidak punya track audio")
-        if re.search(r"Server returned 4\d\d", err):
+        if token and re.search(r"Server returned 4\d\d", err):
             diag = diagnose_drive_error(token, file_id)
             if diag:
                 sa = getattr(creds, "service_account_email", "service account")
@@ -1760,39 +1806,80 @@ def extract_audio_via_ffmpeg(creds, file_id, out_path, tag="", job=None):
         raise RuntimeError("ffmpeg gagal: " + err[-300:])
 
 
-def upload_via_audio(creds, drive, video, tag, state):
-    """Untuk video besar: ekstrak audionya saja (tanpa menyimpan videonya), lalu upload audio."""
-    tmp_path = None
+class NoAudioTrack(RuntimeError):
+    pass
+
+
+MIN_AUDIO_SECONDS = 1.0
+
+
+def audio_duration(path):
+    """Durasi (detik) file audio lokal lewat ffprobe. None kalau tidak terbaca."""
     try:
-        state["stage"] = "ekstrak audio (ffmpeg)"
-        log.info("%s Tahap 1/3 Ekstrak audio dari video %.0f MB (videonya tidak disimpan): %s",
-                 tag, (video.get("size") or 0) / 1024 / 1024, video["path"])
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        tmp_path = tmp.name
-        tmp.close()
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", path],
+            capture_output=True, text=True, timeout=60,
+        )
+        return float(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else 0.0
+    except Exception:
+        return None
 
+
+def _ffmpeg_to_mp3(creds, video, tag, state, local_input=None):
+    """Jalankan ffmpeg, hasil: path mp3 di /tmp (pemanggil wajib menghapusnya)."""
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    tmp_path = tmp.name
+    tmp.close()
+    try:
         t0 = time.time()
-        extract_audio_via_ffmpeg(creds, video["id"], tmp_path, tag, state.get("job"))
+        try:
+            extract_audio_via_ffmpeg(creds, video["id"], tmp_path, tag, state.get("job"), local_input)
+        except RuntimeError as e:
+            if "tidak punya track audio" in str(e):
+                raise NoAudioTrack(str(e))
+            raise
         out_mb = os.path.getsize(tmp_path) / 1024 / 1024
-        if out_mb <= 0:
-            raise RuntimeError("hasil ekstraksi audio kosong")
-        log.info("%s Tahap 1/3 OK - audio %.1f MB (%.0f detik)", tag, out_mb, time.time() - t0)
+        # ffmpeg kadang keluar "sukses" padahal hampir tidak ada audio yang terbaca (mis. stream
+        # terputus); audio kosong begitu jangan sampai di-submit.
+        audio_s = audio_duration(tmp_path)
+        if out_mb <= 0 or (audio_s is not None and audio_s < MIN_AUDIO_SECONDS):
+            raise RuntimeError(f"hasil ekstraksi audio kosong/terlalu pendek ({audio_s or 0:.1f} detik)")
+        log.info("%s Tahap 1/3 OK - audio %.1f MB (%s) dari video %.0f MB (%.0f detik)", tag, out_mb,
+                 format_hms(audio_s) if audio_s else "durasi ?", (video.get("size") or 0) / 1024 / 1024,
+                 time.time() - t0)
+        return tmp_path
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
 
-        state["stage"] = "upload AssemblyAI"
-        log.info("%s Tahap 2/3 Upload audio ke AssemblyAI...", tag)
-        with open(tmp_path, "rb") as f:
-            resp = requests.post(
-                ASSEMBLYAI_UPLOAD_URL,
-                headers={"authorization": ASSEMBLYAI_API_KEY},
-                data=f,
-                timeout=(15, 1800),
-            )
-        resp.raise_for_status()
-        log.info("%s Tahap 2/3 OK", tag)
-        return resp.json()["upload_url"]
+
+def upload_via_audio(creds, drive, video, tag, state):
+    """Ekstrak audionya saja lalu upload audio itu. Videonya TIDAK pernah di-upload.
+    Cara 1: ffmpeg membaca langsung dari Drive (video tidak disimpan).
+    Cara 2 (kalau cara 1 gagal & video <= DISK_MAX_MB): download ke /tmp, ekstrak dari file lokal."""
+    job = state.get("job")
+    state["stage"] = "ekstrak audio (ffmpeg)"
+    log.info("%s Tahap 1/3 Ekstrak audio dari video %.0f MB (videonya tidak disimpan): %s",
+             tag, (video.get("size") or 0) / 1024 / 1024, video["path"])
+    try:
+        audio_path = _ffmpeg_to_mp3(creds, video, tag, state)
+    except NoAudioTrack:
+        raise
+    except Exception as e:
+        size = video.get("size")
+        if (job is not None and job.cancelled) or not size or size > DISK_MAX_BYTES:
+            raise
+        log.warning("%s ekstrak langsung dari Drive gagal (%s) - coba download ke disk dulu", tag, e)
+        video_path = download_to_disk(drive, video, tag, state)
+        try:
+            state["stage"] = "ekstrak audio (ffmpeg, file lokal)"
+            audio_path = _ffmpeg_to_mp3(creds, video, tag, state, local_input=video_path)
+        finally:
+            os.unlink(video_path)
+    try:
+        return upload_file_to_assemblyai(audio_path, tag, state)
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        os.unlink(audio_path)
 
 
 def process_one_video(creds, drive, video, idx, total, job):
@@ -1836,11 +1923,19 @@ def process_one_video(creds, drive, video, idx, total, job):
                   f"Editor ke {sa}. Video ini dilewati; video lain tetap diproses.")
         return
 
-    size = video.get("size")
-    use_audio = bool(size and size > DISK_MAX_BYTES)
-    state = {"stage": "download Drive", "job": job}
+    if shutil.which("ffmpeg"):
+        uploader = upload_via_audio
+    elif ALLOW_RAW_VIDEO_UPLOAD:
+        log.warning("%s ffmpeg TIDAK terpasang - video di-upload utuh (boros bandwidth)", tag)
+        uploader = upload_raw_video
+    else:
+        fail_part(f"ERROR (ffmpeg tidak terpasang) - {name}: backend butuh ffmpeg untuk mengambil audio "
+                  "(video tidak di-upload utuh supaya bandwidth Render tidak habis). Deploy ulang dengan "
+                  "Dockerfile terbaru, atau set ALLOW_RAW_VIDEO_UPLOAD=1 di Render kalau terpaksa.")
+        return
+    state = {"stage": "ekstrak audio (ffmpeg)", "job": job}
     try:
-        upload_url = (upload_via_audio if use_audio else upload_via_disk)(creds, drive, video, tag, state)
+        upload_url = uploader(creds, drive, video, tag, state)
 
         if job.finalized:      # dibatalkan selama upload: jangan submit (hemat kredit transkripsi)
             log.warning("%s job sudah dihentikan - tidak di-submit ke AssemblyAI", tag)
