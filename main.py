@@ -97,6 +97,15 @@ MAX_FOLDER_DEPTH = int(os.environ.get("MAX_FOLDER_DEPTH", "5"))
 DISK_MAX_MB = int(os.environ.get("DISK_MAX_MB", "1500"))
 DISK_MAX_BYTES = DISK_MAX_MB * 1024 * 1024
 AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "64k")
+# AUDIO_MODE=copy (default): kalau audio di video sudah berformat umum (lihat COPY_AUDIO_FORMATS) dan
+#   bitrate-nya <= COPY_MAX_KBPS, audionya DISALIN apa adanya (tanpa diubah): kualitas asli, CPU
+#   sekitar 2,5x lebih ringan (lebih cepat), file sekitar 2x lebih besar dari mp3 64k.
+#   Selain itu, atau kalau penyalinan gagal, audionya diubah ke mp3 seperti AUDIO_MODE=mp3.
+# AUDIO_MODE=mp3: selalu ubah ke mp3 mono 16 kHz (upload paling kecil, CPU paling berat).
+AUDIO_MODE = os.environ.get("AUDIO_MODE", "copy").strip().lower()
+COPY_MAX_KBPS = int(os.environ.get("COPY_MAX_KBPS", "128"))
+COPY_AUDIO_FORMATS = {"aac": ".m4a", "mp3": ".mp3", "opus": ".ogg", "vorbis": ".ogg"}  # codec -> wadah
+MP3_ARGS = ["-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE]
 ALLOW_RAW_VIDEO_UPLOAD = os.environ.get("ALLOW_RAW_VIDEO_UPLOAD", "0") == "1"
 FFMPEG_TIMEOUT_S = int(os.environ.get("FFMPEG_TIMEOUT_S", "3600"))
 PROGRESS_LOG_EVERY_S = 30   # seberapa sering progres ekstraksi audio ditulis ke log
@@ -1676,18 +1685,31 @@ def format_hms(seconds):
     return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
-def probe_duration(token, file_id):
-    """Durasi video (detik) supaya progres bisa ditampilkan dalam persen. None kalau gagal."""
+def probe_media(token, file_id, local_input=None):
+    """Durasi (detik) + format & bitrate audio pertama, lewat ffprobe. Nilai yang tak terbaca = None."""
+    info = {"duration": None, "codec": None, "kbps": None}
+    if local_input:
+        src = [local_input]
+    else:
+        src = ["-headers", f"Authorization: Bearer {token}\r\n", DRIVE_MEDIA_URL.format(file_id=file_id)]
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "error", "-headers", f"Authorization: Bearer {token}\r\n",
-             "-show_entries", "format=duration", "-of", "default=nw=1:nk=1",
-             DRIVE_MEDIA_URL.format(file_id=file_id)],
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_name,bit_rate:format=duration", "-of", "json", *src],
             capture_output=True, text=True, timeout=120,
         )
-        return float(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+        if r.returncode != 0:
+            return info
+        data = json.loads(r.stdout or "{}")
+        info["duration"] = _to_float((data.get("format") or {}).get("duration"))
+        streams = data.get("streams") or []
+        if streams:
+            info["codec"] = streams[0].get("codec_name")
+            br = _to_float(streams[0].get("bit_rate"))
+            info["kbps"] = round(br / 1000) if br else None
     except Exception:
-        return None
+        pass
+    return info
 
 
 def diagnose_drive_error(token, file_id):
@@ -1721,18 +1743,20 @@ def explain_drive_error(status, reason, message, sa_email):
     return base
 
 
-def extract_audio_via_ffmpeg(creds, file_id, out_path, tag="", job=None, local_input=None):
+def extract_audio_via_ffmpeg(creds, file_id, out_path, audio_args, tag="", job=None,
+                             local_input=None, token=None, duration=None):
     """ffmpeg membaca video langsung dari Drive lewat HTTP (mendukung Range, jadi MP4
     yang metadata-nya di akhir file pun aman), membuang video, menyimpan audionya.
+    audio_args: opsi ffmpeg untuk audio keluaran (MP3_ARGS, atau ["-c:a", "copy"]).
     local_input: path video yang sudah di-download (dipakai sebagai ganti Drive HTTP).
     Progres ditulis ke log tiap PROGRESS_LOG_EVERY_S detik."""
     if local_input:
-        token, duration = None, None
+        token = None
         source = ["-i", local_input]
     else:
-        creds.refresh(GoogleAuthRequest())
-        token = creds.token
-        duration = probe_duration(token, file_id)
+        if not token:
+            creds.refresh(GoogleAuthRequest())
+            token = creds.token
         source = [
             "-headers", f"Authorization: Bearer {token}\r\n",
             "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
@@ -1744,7 +1768,7 @@ def extract_audio_via_ffmpeg(creds, file_id, out_path, tag="", job=None, local_i
         "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-nostats", "-threads", "1",
         "-progress", "pipe:1",
         *source,
-        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", AUDIO_BITRATE,
+        "-map", "0:a:0", "-vn", *audio_args,
         "-y", out_path,
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -1796,7 +1820,7 @@ def extract_audio_via_ffmpeg(creds, file_id, out_path, tag="", job=None, local_i
         if token:
             err = err.replace(token, "***")
         err = err.strip()
-        if "does not contain any stream" in err:
+        if "does not contain any stream" in err or "matches no streams" in err:
             raise RuntimeError("video ini tidak punya track audio")
         if token and re.search(r"Server returned 4\d\d", err):
             diag = diagnose_drive_error(token, file_id)
@@ -1825,15 +1849,45 @@ def audio_duration(path):
         return None
 
 
-def _ffmpeg_to_mp3(creds, video, tag, state, local_input=None):
-    """Jalankan ffmpeg, hasil: path mp3 di /tmp (pemanggil wajib menghapusnya)."""
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+def copy_plan(info):
+    """(boleh_disalin, alasan) untuk audio dengan info dari probe_media."""
+    if AUDIO_MODE != "copy":
+        return False, "AUDIO_MODE=mp3"
+    codec, kbps = info.get("codec"), info.get("kbps")
+    if codec not in COPY_AUDIO_FORMATS:
+        return False, f"format audio {codec or 'tidak terbaca'} tidak disalin"
+    if kbps and kbps > COPY_MAX_KBPS:
+        return False, f"audio {codec} {kbps} kbps > batas {COPY_MAX_KBPS} kbps"
+    return True, f"{codec} {kbps or '?'} kbps"
+
+
+def _ffmpeg_to_audio(creds, video, tag, state, local_input=None, allow_copy=True):
+    """Ambil audio video: disalin apa adanya kalau memungkinkan, kalau tidak diubah ke mp3.
+    Hasil: path file audio di /tmp (pemanggil wajib menghapusnya)."""
+    token = None
+    if not local_input:
+        creds.refresh(GoogleAuthRequest())
+        token = creds.token
+    info = probe_media(token, video["id"], local_input)
+    if info["duration"]:
+        log.info("%s   durasi video: %s", tag, format_hms(info["duration"]))
+    can_copy, why = copy_plan(info) if allow_copy else (False, "ubah ke mp3")
+    if can_copy:
+        suffix, audio_args = COPY_AUDIO_FORMATS[info["codec"]], ["-c:a", "copy"]
+        state["copy_tried"] = True
+        state["audio_kind"] = f"audio asli disalin ({why})"
+    else:
+        suffix, audio_args = ".mp3", MP3_ARGS
+        state["audio_kind"] = f"audio mp3 {AUDIO_BITRATE}"
+    log.info("%s   cara ekstrak: %s%s", tag, state["audio_kind"], "" if can_copy else f" - {why}")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp_path = tmp.name
     tmp.close()
     try:
         t0 = time.time()
         try:
-            extract_audio_via_ffmpeg(creds, video["id"], tmp_path, tag, state.get("job"), local_input)
+            extract_audio_via_ffmpeg(creds, video["id"], tmp_path, audio_args, tag, state.get("job"),
+                                     local_input, token, info["duration"])
         except RuntimeError as e:
             if "tidak punya track audio" in str(e):
                 raise NoAudioTrack(str(e))
@@ -1844,9 +1898,9 @@ def _ffmpeg_to_mp3(creds, video, tag, state, local_input=None):
         audio_s = audio_duration(tmp_path)
         if out_mb <= 0 or (audio_s is not None and audio_s < MIN_AUDIO_SECONDS):
             raise RuntimeError(f"hasil ekstraksi audio kosong/terlalu pendek ({audio_s or 0:.1f} detik)")
-        log.info("%s Tahap 1/3 OK - audio %.1f MB (%s) dari video %.0f MB (%.0f detik)", tag, out_mb,
-                 format_hms(audio_s) if audio_s else "durasi ?", (video.get("size") or 0) / 1024 / 1024,
-                 time.time() - t0)
+        log.info("%s Tahap 1/3 OK - %s %.1f MB (%s) dari video %.0f MB (%.0f detik)", tag,
+                 state["audio_kind"], out_mb, format_hms(audio_s) if audio_s else "durasi ?",
+                 (video.get("size") or 0) / 1024 / 1024, time.time() - t0)
         return tmp_path
     except BaseException:
         os.unlink(tmp_path)
@@ -1855,29 +1909,45 @@ def _ffmpeg_to_mp3(creds, video, tag, state, local_input=None):
 
 def upload_via_audio(creds, drive, video, tag, state):
     """Ekstrak audionya saja lalu upload audio itu. Videonya TIDAK pernah di-upload.
-    Cara 1: ffmpeg membaca langsung dari Drive (video tidak disimpan).
-    Cara 2 (kalau cara 1 gagal & video <= DISK_MAX_MB): download ke /tmp, ekstrak dari file lokal."""
+    Cara 1: ffmpeg membaca langsung dari Drive (video tidak disimpan); audio disalin kalau bisa.
+    Cara 2 (kalau penyalinan di cara 1 gagal): sama, tapi audio diubah ke mp3.
+    Cara 3 (kalau masih gagal & video <= DISK_MAX_MB): download ke /tmp, ekstrak mp3 dari file lokal."""
     job = state.get("job")
     state["stage"] = "ekstrak audio (ffmpeg)"
     log.info("%s Tahap 1/3 Ekstrak audio dari video %.0f MB (videonya tidak disimpan): %s",
              tag, (video.get("size") or 0) / 1024 / 1024, video["path"])
+    audio_path, last_err = None, None
     try:
-        audio_path = _ffmpeg_to_mp3(creds, video, tag, state)
+        audio_path = _ffmpeg_to_audio(creds, video, tag, state)
     except NoAudioTrack:
         raise
     except Exception as e:
-        size = video.get("size")
-        if (job is not None and job.cancelled) or not size or size > DISK_MAX_BYTES:
+        if job is not None and job.cancelled:
             raise
-        log.warning("%s ekstrak langsung dari Drive gagal (%s) - coba download ke disk dulu", tag, e)
+        last_err = e
+        if state.pop("copy_tried", False):
+            log.warning("%s salin audio gagal (%s) - coba ubah ke mp3", tag, e)
+            try:
+                audio_path = _ffmpeg_to_audio(creds, video, tag, state, allow_copy=False)
+            except NoAudioTrack:
+                raise
+            except Exception as e2:
+                if job is not None and job.cancelled:
+                    raise
+                last_err = e2
+    if audio_path is None:
+        size = video.get("size")
+        if not size or size > DISK_MAX_BYTES:
+            raise last_err
+        log.warning("%s ekstrak langsung dari Drive gagal (%s) - coba download ke disk dulu", tag, last_err)
         video_path = download_to_disk(drive, video, tag, state)
         try:
             state["stage"] = "ekstrak audio (ffmpeg, file lokal)"
-            audio_path = _ffmpeg_to_mp3(creds, video, tag, state, local_input=video_path)
+            audio_path = _ffmpeg_to_audio(creds, video, tag, state, local_input=video_path, allow_copy=False)
         finally:
             os.unlink(video_path)
     try:
-        return upload_file_to_assemblyai(audio_path, tag, state)
+        return upload_file_to_assemblyai(audio_path, tag, state, what=state.get("audio_kind", "audio"))
     finally:
         os.unlink(audio_path)
 
