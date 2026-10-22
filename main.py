@@ -123,8 +123,8 @@ APIFY_RUN_URL = "https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-item
 YOUTUBE_PLAYLIST_URL = "https://www.googleapis.com/youtube/v3/playlistItems"
 ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
 
-# Batas keras jumlah video per permintaan (pengaman kredit AssemblyAI).
-HARD_CAP_VIDEOS = 20
+# Batas keras jumlah video per permintaan (pengaman kredit AssemblyAI). Atur lewat env HARD_CAP_VIDEOS.
+HARD_CAP_VIDEOS = int(os.environ.get("HARD_CAP_VIDEOS", "50"))
 
 # "id" = Indonesia. Ganti kalau bahasa dominan video berbeda.
 TRANSCRIPT_LANGUAGE_CODE = "id"
